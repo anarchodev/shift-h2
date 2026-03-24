@@ -161,19 +161,40 @@ static void consume_responses(sh2_context_t *ctx) {
  * Drive all connections that have pending nghttp2 output
  * -------------------------------------------------------------------------- */
 
+/* Idle threshold: evict connections with no activity for this many polls.
+ * nghttp2 silently drops certain protocol violations (e.g. frames on
+ * evicted closed streams) without generating error responses, leaving
+ * sessions stuck with want_read=1 and no data flowing. */
+#define SH2_IDLE_POLL_THRESHOLD 100000
+
 static void drive_all_sends(sh2_context_t *ctx) {
   uint32_t driven = 0;
   for (uint32_t i = 0; i < ctx->max_connections; i++) {
-    if (ctx->conns[i].ng_session &&
-        nghttp2_session_want_write(ctx->conns[i].ng_session)) {
+    if (!ctx->conns[i].ng_session)
+      continue;
+
+    /* evict idle connections — safety net for zombie sessions */
+    if (ctx->poll_count - ctx->conns[i].last_active_poll > SH2_IDLE_POLL_THRESHOLD) {
+      SH2_DBG("[idle_evict] conn=%u idle=%lu polls\n",
+              i, (unsigned long)(ctx->poll_count - ctx->conns[i].last_active_poll));
+      sh2_conn_close(ctx, i);
+      continue;
+    }
+
+    /* drive sessions that want to write, OR sessions that are done
+     * (neither want_read nor want_write) — the latter need teardown
+     * which happens inside sh2_drive_send after the send loop */
+    if (nghttp2_session_want_write(ctx->conns[i].ng_session) ||
+        !nghttp2_session_want_read(ctx->conns[i].ng_session)) {
       sh2_drive_send(ctx, i);
+      ctx->conns[i].last_active_poll = ctx->poll_count;
       driven++;
     }
   }
   static _Thread_local uint64_t call_count = 0;
   call_count++;
   if (driven > 0 && call_count % 1000 == 0)
-    fprintf(stderr, "[drive_all] driven=%u\n", driven);
+    SH2_DBG("[drive_all] driven=%u\n", driven);
 }
 
 /* --------------------------------------------------------------------------
@@ -347,6 +368,7 @@ static void reads_init_connections(sh2_context_t *ctx) {
     *conn = (sh2_conn_t){
         .conn_entity = conns[i].entity,
         .user_conn_entity = user_conn,
+        .last_active_poll = ctx->poll_count,
     };
 
     if (sh2_nghttp2_session_create(ctx, conn_idx) != sh2_ok) {
@@ -414,6 +436,8 @@ static void reads_feed_data(sh2_context_t *ctx) {
       continue;
     }
 
+    conn->last_active_poll = ctx->poll_count;
+
     /* recycle read buffer */
     SH2_CHECK(shift_entity_move_one(sh, entities[i], sio_colls->read_in),
               "recycle read buffer");
@@ -477,6 +501,8 @@ static void writes_account_and_close(sh2_context_t *ctx) {
     if (conn->pending_writes > 0)
       conn->pending_writes--;
 
+    conn->last_active_poll = ctx->poll_count;
+
     /* on write error, close active connection */
     if (results[i].error != 0 && cidx->state == SH2_CONN_ACTIVE)
       sh2_conn_close(ctx, cidx->idx);
@@ -513,9 +539,8 @@ sh2_result_t sh2_poll(sh2_context_t *ctx, uint32_t min_complete) {
   if (!ctx)
     return sh2_error_null;
 
-  static _Thread_local uint64_t poll_count = 0;
   static _Thread_local uint64_t last_active = 0;
-  poll_count++;
+  uint64_t poll_count = ++ctx->poll_count;
 
   sio_result_t sr = sio_poll(ctx->sio, min_complete);
   if (sr != sio_ok) {
@@ -583,29 +608,47 @@ sh2_result_t sh2_poll(sh2_context_t *ctx, uint32_t min_complete) {
     shift_collection_get_entities(ctx->shift, ctx->coll_read_init, &tmp, &n_read_init);
     shift_collection_get_entities(ctx->shift, ctx->coll_read_active, &tmp, &n_read_active);
 
-    size_t total = n_resp_in + n_read_res + n_write_res + n_req_out +
-                   n_sending + n_result + n_read_in + n_write_in +
-                   n_read_err + n_read_init + n_read_active;
-    if (total > 0) last_active = poll_count;
+    size_t n_conns_coll = 0;
+    shift_collection_get_entities(ctx->shift, dbg_sio->connections, &tmp, &n_conns_coll);
+
+    /* count entities across ALL collections (including sio-internal) */
+    size_t n_total_entities = 0;
+    size_t n_collections = shift_collection_count(ctx->shift);
+    for (size_t c = 1; c < n_collections; c++) {
+      n_total_entities += shift_collection_entity_count(ctx->shift, (shift_collection_id_t){(uint32_t)c});
+    }
+
+    size_t tracked = n_resp_in + n_read_res + n_write_res + n_req_out +
+                     n_sending + n_result + n_read_in + n_write_in +
+                     n_read_err + n_read_init + n_read_active + n_conns_coll;
+    if (tracked > 0) last_active = poll_count;
 
     uint32_t active = 0, pending_wr = 0;
+    uint32_t want_r = 0, want_w = 0;
     for (uint32_t i = 0; i < ctx->max_connections; i++) {
-      if (ctx->conns[i].ng_session) active++;
+      if (ctx->conns[i].ng_session) {
+        active++;
+        if (nghttp2_session_want_read(ctx->conns[i].ng_session)) want_r++;
+        if (nghttp2_session_want_write(ctx->conns[i].ng_session)) want_w++;
+      }
       pending_wr += ctx->conns[i].pending_writes;
     }
 
     /* log every 10000 polls, or if idle for 5000 polls with active conns */
     if (poll_count % 10000 == 0 ||
         (active > 0 && poll_count - last_active > 5000 && poll_count % 1000 == 0)) {
-      fprintf(stderr,
+      SH2_DBG(
         "[poll #%lu] rd_res=%zu rd_err=%zu rd_init=%zu rd_act=%zu "
         "rd_in=%zu wr_res=%zu wr_in=%zu | resp_in=%zu req_out=%zu "
-        "sending=%zu result=%zu | conns=%u pend_wr=%u idle=%lu\n",
+        "sending=%zu result=%zu | sio_conns=%zu total_ent=%zu "
+        "| conns=%u pend_wr=%u want_r=%u want_w=%u idle=%lu\n",
         (unsigned long)poll_count,
         n_read_res, n_read_err, n_read_init, n_read_active,
         n_read_in, n_write_res, n_write_in,
         n_resp_in, n_req_out, n_sending, n_result,
-        active, pending_wr, (unsigned long)(poll_count - last_active));
+        n_conns_coll, n_total_entities,
+        active, pending_wr, want_r, want_w,
+        (unsigned long)(poll_count - last_active));
     }
   }
 

@@ -281,7 +281,7 @@ static int on_stream_close(nghttp2_session *session, int32_t stream_id,
     }
 
     if (g_stream_close_count % 10000 == 0) {
-        fprintf(stderr, "[stream_close] total=%lu emitted=%lu not_emitted=%lu\n",
+        SH2_DBG("[stream_close] total=%lu emitted=%lu not_emitted=%lu\n",
                 (unsigned long)g_stream_close_count,
                 (unsigned long)g_stream_close_emitted,
                 (unsigned long)g_stream_close_not_emitted);
@@ -399,7 +399,7 @@ void sh2_nghttp2_session_destroy(sh2_context_t *ctx, uint32_t conn_idx) {
         size_t after = 0;
         shift_collection_get_entities(ctx->shift, ctx->coll_response_sending,
                                       &tmp, &after);
-        fprintf(stderr, "[session_destroy] conn=%u sending: %zu -> %zu (drained %zu)\n",
+        SH2_DBG("[session_destroy] conn=%u sending: %zu -> %zu (drained %zu)\n",
                 conn_idx, before, after, before - after);
     }
 

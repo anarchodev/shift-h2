@@ -4,6 +4,13 @@
 #include <shift_io.h>
 #include <nghttp2/nghttp2.h>
 #include <stdbool.h>
+#include <stdio.h>
+
+#ifdef NDEBUG
+  #define SH2_DBG(...) ((void)0)
+#else
+  #define SH2_DBG(...) fprintf(stderr, __VA_ARGS__)
+#endif
 
 /* --------------------------------------------------------------------------
  * Internal connection index component (on sio connection_results entities)
@@ -31,6 +38,7 @@ typedef struct {
     shift_entity_t     user_conn_entity; /* sio user connection entity */
     uint32_t           pending_writes;   /* outstanding write entities */
     bool               draining;         /* session done, waiting for writes */
+    uint64_t           last_active_poll; /* poll tick of last activity */
 } sh2_conn_t;
 
 /* --------------------------------------------------------------------------
@@ -103,4 +111,7 @@ struct sh2_context {
 
     /* nghttp2 shared callbacks */
     nghttp2_session_callbacks  *ng_callbacks;
+
+    /* poll tick counter (for idle connection detection) */
+    uint64_t                    poll_count;
 };
