@@ -32,6 +32,8 @@ set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(nghttp2)
 
+option(ENABLE_TLS "Enable TLS support via OpenSSL" ON)
+
 add_library(shift_h2 STATIC
     src/shift_h2.c
     src/sh2_nghttp2.c
@@ -45,6 +47,17 @@ target_link_libraries(shift_h2
     PUBLIC  shift shift-io
     PRIVATE nghttp2_static
 )
+
+if(ENABLE_TLS)
+    find_package(OpenSSL)
+    if(OpenSSL_FOUND)
+        target_sources(shift_h2 PRIVATE src/sh2_tls.c)
+        target_compile_definitions(shift_h2 PUBLIC SH2_HAS_TLS=1)
+        target_link_libraries(shift_h2 PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    else()
+        message(WARNING "OpenSSL not found — building without TLS support")
+    endif()
+endif()
 
 option(BUILD_EXAMPLES "Build examples" ON)
 if(BUILD_EXAMPLES)

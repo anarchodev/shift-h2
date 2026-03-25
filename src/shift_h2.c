@@ -88,6 +88,7 @@ sh2_result_t sh2_register_components(shift_t *sh, sh2_component_ids_t *out) {
     REG_EX(resp_body,    sh2_resp_body_t,    resp_body_dtor)
     REG(status,       sh2_status_t)
     REG(io_result,    sh2_io_result_t)
+    REG(domain_tag,   sh2_domain_tag_t)
 
 #undef REG
 #undef REG_EX
@@ -135,6 +136,7 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             ctx->internal_conn_idx,
         };
         shift_collection_info_t ci = {
+            .name       = "sio_connection_results",
             .comp_ids   = comps,
             .comp_count = sizeof(comps) / sizeof(comps[0]),
         };
@@ -152,6 +154,7 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             ctx->sio_comp_ids.user_conn_entity,
         };
         shift_collection_info_t ci = {
+            .name       = "sio_read_results",
             .comp_ids   = comps,
             .comp_count = sizeof(comps) / sizeof(comps[0]),
         };
@@ -169,6 +172,7 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             ctx->sio_comp_ids.user_conn_entity,
         };
         shift_collection_info_t ci = {
+            .name       = "sio_write_results",
             .comp_ids   = comps,
             .comp_count = sizeof(comps) / sizeof(comps[0]),
         };
@@ -207,8 +211,10 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             cfg->comp_ids.req_headers, cfg->comp_ids.req_body,
             cfg->comp_ids.resp_headers, cfg->comp_ids.resp_body,
             cfg->comp_ids.status,     cfg->comp_ids.io_result,
+            cfg->comp_ids.domain_tag,
         };
         shift_collection_info_t ci = {
+            .name       = "response_sending",
             .comp_ids   = comps,
             .comp_count = sizeof(comps) / sizeof(comps[0]),
         };
@@ -228,15 +234,17 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             ctx->sio_comp_ids.conn_entity,
             ctx->sio_comp_ids.user_conn_entity,
         };
-        shift_collection_info_t ci = {
-            .comp_ids   = comps,
-            .comp_count = sizeof(comps) / sizeof(comps[0]),
-        };
-        if (shift_collection_register(ctx->shift, &ci,
+        shift_collection_info_t ci_err  = { .name = "read_errors",  .comp_ids = comps,
+                                            .comp_count = sizeof(comps) / sizeof(comps[0]) };
+        shift_collection_info_t ci_init = { .name = "read_init",    .comp_ids = comps,
+                                            .comp_count = sizeof(comps) / sizeof(comps[0]) };
+        shift_collection_info_t ci_act  = { .name = "read_active",  .comp_ids = comps,
+                                            .comp_count = sizeof(comps) / sizeof(comps[0]) };
+        if (shift_collection_register(ctx->shift, &ci_err,
                                       &ctx->coll_read_errors) != shift_ok ||
-            shift_collection_register(ctx->shift, &ci,
+            shift_collection_register(ctx->shift, &ci_init,
                                       &ctx->coll_read_init) != shift_ok ||
-            shift_collection_register(ctx->shift, &ci,
+            shift_collection_register(ctx->shift, &ci_act,
                                       &ctx->coll_read_active) != shift_ok) {
             sio_context_destroy(ctx->sio);
             free(ctx);
@@ -262,6 +270,42 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         return r;
     }
 
+#ifdef SH2_HAS_TLS
+    if (cfg->tls) {
+        ctx->tls_config = cfg->tls;
+
+        /* TLS handshake collection (same archetype as read results) */
+        shift_component_id_t comps[] = {
+            ctx->sio_comp_ids.read_buf,
+            ctx->sio_comp_ids.io_result,
+            ctx->sio_comp_ids.conn_entity,
+            ctx->sio_comp_ids.user_conn_entity,
+        };
+        shift_collection_info_t ci = {
+            .name       = "read_tls_handshake",
+            .comp_ids   = comps,
+            .comp_count = sizeof(comps) / sizeof(comps[0]),
+        };
+        if (shift_collection_register(ctx->shift, &ci,
+                                      &ctx->coll_read_handshake) != shift_ok) {
+            sio_context_destroy(ctx->sio);
+            free(ctx->conns);
+            nghttp2_session_callbacks_del(ctx->ng_callbacks);
+            free(ctx);
+            return sh2_error_invalid;
+        }
+
+        r = sh2_tls_init(ctx);
+        if (r != sh2_ok) {
+            sio_context_destroy(ctx->sio);
+            free(ctx->conns);
+            nghttp2_session_callbacks_del(ctx->ng_callbacks);
+            free(ctx);
+            return r;
+        }
+    }
+#endif
+
     *out = ctx;
     return sh2_ok;
 }
@@ -270,6 +314,9 @@ void sh2_context_destroy(sh2_context_t *ctx) {
     if (!ctx) return;
 
     for (uint32_t i = 0; i < ctx->max_connections; i++) {
+#ifdef SH2_HAS_TLS
+        sh2_tls_conn_destroy(ctx, i);
+#endif
         if (ctx->conns[i].ng_session)
             sh2_nghttp2_session_destroy(ctx, i);
     }
@@ -286,6 +333,10 @@ void sh2_context_destroy(sh2_context_t *ctx) {
     }
 
     sio_context_destroy(ctx->sio);
+
+#ifdef SH2_HAS_TLS
+    sh2_tls_cleanup(ctx);
+#endif
 
     if (ctx->ng_callbacks)
         nghttp2_session_callbacks_del(ctx->ng_callbacks);

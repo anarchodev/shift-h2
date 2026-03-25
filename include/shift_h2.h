@@ -75,6 +75,10 @@ typedef struct {
     int error; /* 0 = success; negative = errno-style error code */
 } sh2_io_result_t;
 
+typedef struct {
+    uint64_t tag; /* opaque tenant/domain identifier; 0 for h2c */
+} sh2_domain_tag_t;
+
 /* --------------------------------------------------------------------------
  * Registered IDs
  * -------------------------------------------------------------------------- */
@@ -88,6 +92,7 @@ typedef struct {
     shift_component_id_t resp_body;
     shift_component_id_t status;
     shift_component_id_t io_result;
+    shift_component_id_t domain_tag;
 } sh2_component_ids_t;
 
 typedef struct {
@@ -112,6 +117,44 @@ typedef struct {
 } sh2_collection_ids_t;
 
 /* --------------------------------------------------------------------------
+ * TLS (optional — requires SH2_HAS_TLS at build time)
+ * -------------------------------------------------------------------------- */
+
+#ifdef SH2_HAS_TLS
+
+typedef struct sh2_tls_config sh2_tls_config_t;
+typedef uint32_t sh2_cert_id_t;
+
+sh2_result_t sh2_tls_config_create(sh2_tls_config_t **out);
+void         sh2_tls_config_destroy(sh2_tls_config_t *cfg);
+
+/* Register a PEM-encoded certificate chain + private key.  Parsed once;
+ * OpenSSL types are stored internally.  Returns a cert_id handle. */
+sh2_result_t sh2_tls_config_add_cert(sh2_tls_config_t *cfg,
+                                      const char *cert_pem,
+                                      const char *key_pem,
+                                      sh2_cert_id_t *out_id);
+
+/* SNI callback result — returned by the application to select a certificate
+ * and associate an opaque domain_tag with the connection. */
+typedef struct {
+    sh2_cert_id_t cert_id;
+    uint64_t      domain_tag;
+} sh2_sni_result_t;
+
+/* Called during TLS handshake with the SNI hostname from the client.
+ * Return the cert_id of the certificate to use and a domain_tag that
+ * will be attached to every request on this connection. */
+typedef sh2_sni_result_t (*sh2_sni_callback_t)(
+    const char *hostname, uint32_t hostname_len, void *user_data);
+
+sh2_result_t sh2_tls_config_set_sni_callback(sh2_tls_config_t *cfg,
+                                              sh2_sni_callback_t cb,
+                                              void *user_data);
+
+#endif /* SH2_HAS_TLS */
+
+/* --------------------------------------------------------------------------
  * Configuration
  * -------------------------------------------------------------------------- */
 
@@ -132,6 +175,11 @@ typedef struct {
     shift_collection_id_t request_out;
     shift_collection_id_t response_in;
     shift_collection_id_t response_result_out;
+#ifdef SH2_HAS_TLS
+    /* TLS configuration — NULL = cleartext h2c.  Non-NULL enables TLS
+     * with ALPN h2 negotiation and SNI-based certificate selection. */
+    sh2_tls_config_t *tls;
+#endif
 } sh2_config_t;
 
 /* --------------------------------------------------------------------------

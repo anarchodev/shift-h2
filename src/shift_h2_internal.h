@@ -21,13 +21,18 @@ typedef struct {
     uint8_t  state; /* SH2_CONN_* */
 } sh2_conn_idx_t;
 
-#define SH2_CONN_NEW    0
-#define SH2_CONN_ACTIVE 1
-#define SH2_CONN_CLOSED 2
+#define SH2_CONN_NEW            0
+#define SH2_CONN_ACTIVE         1
+#define SH2_CONN_CLOSED         2
+#define SH2_CONN_TLS_HANDSHAKE  3
 
 /* --------------------------------------------------------------------------
  * Per-connection state
  * -------------------------------------------------------------------------- */
+
+#ifdef SH2_HAS_TLS
+#include "sh2_tls.h"
+#endif
 
 typedef struct sh2_ng_ctx sh2_ng_ctx_t;
 
@@ -39,6 +44,9 @@ typedef struct {
     uint32_t           pending_writes;   /* outstanding write entities */
     bool               draining;         /* session done, waiting for writes */
     uint64_t           last_active_poll; /* poll tick of last activity */
+#ifdef SH2_HAS_TLS
+    sh2_tls_conn_t    *tls;             /* NULL for h2c connections */
+#endif
 } sh2_conn_t;
 
 /* --------------------------------------------------------------------------
@@ -114,4 +122,11 @@ struct sh2_context {
 
     /* poll tick counter (for idle connection detection) */
     uint64_t                    poll_count;
+
+#ifdef SH2_HAS_TLS
+    /* TLS state */
+    SSL_CTX                    *ssl_ctx;
+    sh2_tls_config_t           *tls_config;     /* borrowed ref to user config */
+    shift_collection_id_t       coll_read_handshake; /* TLS handshake data */
+#endif
 };

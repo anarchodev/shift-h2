@@ -12,7 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define PORT            9000
+#define PORT            9443
 #define BACKLOG         4096
 #define MAX_CONNECTIONS 16384
 #define MAX_STREAMS     (MAX_CONNECTIONS * 128)
@@ -24,22 +24,74 @@ static volatile int g_running = 1;
 
 static void handle_signal(int sig) { (void)sig; g_running = 0; }
 
-typedef struct {
-    int worker_id;
-    int worker_core;
-} worker_config_t;
+/* --------------------------------------------------------------------------
+ * SNI callback — demonstrates multi-tenant certificate selection
+ * -------------------------------------------------------------------------- */
 
-static void pin_to_core(int core) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(core, &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+typedef struct {
+    const char   *hostname;
+    sh2_cert_id_t cert_id;
+    uint64_t      domain_tag;
+} domain_entry_t;
+
+typedef struct {
+    domain_entry_t *entries;
+    uint32_t        count;
+    sh2_cert_id_t   default_cert;
+} sni_table_t;
+
+static sh2_sni_result_t sni_select(const char *hostname, uint32_t hostname_len,
+                                    void *user_data) {
+    sni_table_t *table = user_data;
+
+    for (uint32_t i = 0; i < table->count; i++) {
+        if (strlen(table->entries[i].hostname) == hostname_len &&
+            memcmp(table->entries[i].hostname, hostname, hostname_len) == 0) {
+            return (sh2_sni_result_t){
+                .cert_id    = table->entries[i].cert_id,
+                .domain_tag = table->entries[i].domain_tag,
+            };
+        }
+    }
+
+    /* fallback to default cert, tag 0 */
+    return (sh2_sni_result_t){ .cert_id = table->default_cert, .domain_tag = 0 };
 }
+
+/* --------------------------------------------------------------------------
+ * File loading helper
+ * -------------------------------------------------------------------------- */
+
+static char *load_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { perror(path); return NULL; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    fread(buf, 1, (size_t)sz, f);
+    buf[sz] = '\0';
+    fclose(f);
+    return buf;
+}
+
+/* --------------------------------------------------------------------------
+ * Echo body builder
+ * -------------------------------------------------------------------------- */
 
 static char *build_echo_body(const sh2_req_headers_t *rh,
                              const sh2_req_body_t    *rb,
+                             uint64_t                 domain_tag,
                              uint32_t                *out_len) {
     size_t len = 0;
+
+    /* "domain_tag: <value>\n" */
+    char tag_line[64];
+    int tag_len = snprintf(tag_line, sizeof(tag_line),
+                           "domain_tag: %lu\n", (unsigned long)domain_tag);
+
+    len += (size_t)tag_len;
     for (uint32_t i = 0; i < rh->count; i++)
         len += rh->fields[i].name_len + 2 + rh->fields[i].value_len + 1;
     if (rb->len > 0)
@@ -49,6 +101,9 @@ static char *build_echo_body(const sh2_req_headers_t *rh,
     if (!buf) return NULL;
 
     size_t pos = 0;
+    memcpy(buf, tag_line, (size_t)tag_len);
+    pos += (size_t)tag_len;
+
     for (uint32_t i = 0; i < rh->count; i++) {
         const sh2_header_field_t *f = &rh->fields[i];
         memcpy(buf + pos, f->name, f->name_len);   pos += f->name_len;
@@ -66,6 +121,24 @@ static char *build_echo_body(const sh2_req_headers_t *rh,
     return buf;
 }
 
+/* --------------------------------------------------------------------------
+ * Worker thread
+ * -------------------------------------------------------------------------- */
+
+typedef struct {
+    int               worker_id;
+    int               worker_core;
+    sh2_tls_config_t *tls_config;
+    sni_table_t      *sni_table;
+} worker_config_t;
+
+static void pin_to_core(int core) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+}
+
 static void *worker_fn(void *arg) {
     worker_config_t *wcfg = arg;
 
@@ -77,8 +150,8 @@ static void *worker_fn(void *arg) {
     shift_t *sh = NULL;
     shift_config_t sh_cfg = {
         .max_entities            = MAX_CONNECTIONS * 16 + MAX_STREAMS + 1024,
-        .max_components          = 32,
-        .max_collections         = 32,
+        .max_components          = 64,
+        .max_collections         = 64,
         .deferred_queue_capacity = MAX_CONNECTIONS * 256,
         .allocator               = {0},
     };
@@ -140,6 +213,7 @@ static void *worker_fn(void *arg) {
         .request_out         = request_out,
         .response_in         = response_in,
         .response_result_out = response_result_out,
+        .tls                 = wcfg->tls_config,
     };
     sh2_result_t r = sh2_context_create(&cfg, &ctx);
     if (r != sh2_ok) {
@@ -156,7 +230,7 @@ static void *worker_fn(void *arg) {
         return NULL;
     }
 
-    printf("Worker %d: h2c echo server listening on port %d\n", wcfg->worker_id, PORT);
+    printf("Worker %d: h2 TLS echo server listening on port %d\n", wcfg->worker_id, PORT);
 
     /* ---- Event loop ---- */
     while (g_running) {
@@ -174,13 +248,18 @@ static void *worker_fn(void *arg) {
 
                 sh2_req_headers_t *rqh = NULL;
                 sh2_req_body_t    *rqb = NULL;
+                sh2_domain_tag_t  *dt  = NULL;
                 shift_entity_get_component(sh, e, comp.req_headers,
                                            (void **)&rqh);
                 shift_entity_get_component(sh, e, comp.req_body,
                                            (void **)&rqb);
+                shift_entity_get_component(sh, e, comp.domain_tag,
+                                           (void **)&dt);
+
+                uint64_t tag = dt ? dt->tag : 0;
 
                 uint32_t echo_len = 0;
-                char    *echo_buf = build_echo_body(rqh, rqb, &echo_len);
+                char    *echo_buf = build_echo_body(rqh, rqb, tag, &echo_len);
 
                 sh2_header_field_t *resp_fields =
                     malloc(sizeof(sh2_header_field_t));
@@ -263,20 +342,77 @@ static void *worker_fn(void *arg) {
     return NULL;
 }
 
+/* --------------------------------------------------------------------------
+ * main
+ * -------------------------------------------------------------------------- */
+
+static void usage(const char *prog) {
+    fprintf(stderr, "Usage: %s <cert.pem> <key.pem> [workers]\n", prog);
+}
+
 int main(int argc, char **argv) {
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
+    if (argc < 3) { usage(argv[0]); return 1; }
+
+    const char *cert_path = argv[1];
+    const char *key_path  = argv[2];
+
+    char *cert_pem = load_file(cert_path);
+    char *key_pem  = load_file(key_path);
+    if (!cert_pem || !key_pem) {
+        fprintf(stderr, "Failed to load cert/key files\n");
+        free(cert_pem); free(key_pem);
+        return 1;
+    }
+
+    /* ---- TLS config ---- */
+    sh2_tls_config_t *tls = NULL;
+    if (sh2_tls_config_create(&tls) != sh2_ok) {
+        fprintf(stderr, "sh2_tls_config_create failed\n");
+        free(cert_pem); free(key_pem);
+        return 1;
+    }
+
+    sh2_cert_id_t cert_id;
+    if (sh2_tls_config_add_cert(tls, cert_pem, key_pem, &cert_id) != sh2_ok) {
+        fprintf(stderr, "sh2_tls_config_add_cert failed\n");
+        sh2_tls_config_destroy(tls);
+        free(cert_pem); free(key_pem);
+        return 1;
+    }
+    free(cert_pem);
+    free(key_pem);
+
+    /* Simple SNI table — maps hostnames to certs and tenant tags */
+    domain_entry_t domains[] = {
+        { "localhost",            cert_id, 1 },
+        { "tenant1.example.com", cert_id, 100 },
+        { "tenant2.example.com", cert_id, 200 },
+    };
+    sni_table_t sni_table = {
+        .entries      = domains,
+        .count        = sizeof(domains) / sizeof(domains[0]),
+        .default_cert = cert_id,
+    };
+
+    sh2_tls_config_set_sni_callback(tls, sni_select, &sni_table);
+
+    printf("Registered %u cert(s), %u domain(s)\n",
+           1, sni_table.count);
+
+    /* ---- Workers ---- */
     long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
     int  nworkers = (int)ncpus;
-    if (argc > 1)
-        nworkers = atoi(argv[1]);
+    if (argc > 3)
+        nworkers = atoi(argv[3]);
     if (nworkers < 1)
         nworkers = 1;
     if (nworkers > (int)ncpus)
         nworkers = (int)ncpus;
 
-    printf("h2c echo server: %d workers on %ld cores, port %d\n",
+    printf("h2 TLS echo server: %d workers on %ld cores, port %d\n",
            nworkers, ncpus, PORT);
 
     worker_config_t *configs = calloc((size_t)nworkers, sizeof(worker_config_t));
@@ -285,6 +421,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nworkers; i++) {
         configs[i].worker_id   = i;
         configs[i].worker_core = i;
+        configs[i].tls_config  = tls;
+        configs[i].sni_table   = &sni_table;
         pthread_create(&threads[i], NULL, worker_fn, &configs[i]);
     }
 
@@ -293,6 +431,7 @@ int main(int argc, char **argv) {
 
     printf("\nShutting down.\n");
 
+    sh2_tls_config_destroy(tls);
     free(threads);
     free(configs);
     return 0;

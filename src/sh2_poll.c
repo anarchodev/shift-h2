@@ -256,6 +256,15 @@ static void reads_triage(sh2_context_t *ctx) {
       continue;
     }
 
+#ifdef SH2_HAS_TLS
+    /* TLS handshake in progress */
+    if (cidx->state == SH2_CONN_TLS_HANDSHAKE) {
+      SH2_CHECK(shift_entity_move_one(sh, entities[i], ctx->coll_read_handshake),
+                "triage: tls_handshake → handshake");
+      continue;
+    }
+#endif
+
     /* active connection with data */
     SH2_CHECK(shift_entity_move_one(sh, entities[i], ctx->coll_read_active),
               "triage: active → active");
@@ -296,7 +305,11 @@ static void reads_handle_errors(sh2_context_t *ctx) {
                                             (void **)&cidx),
                 "get conn_idx (errors)");
 
-      if (cidx->state == SH2_CONN_ACTIVE) {
+      if (cidx->state == SH2_CONN_ACTIVE
+#ifdef SH2_HAS_TLS
+          || cidx->state == SH2_CONN_TLS_HANDSHAKE
+#endif
+         ) {
         sh2_conn_close(ctx, cidx->idx);
       } else if (cidx->state == SH2_CONN_NEW) {
         if (!shift_entity_is_stale(sh, conns[i].entity))
@@ -362,7 +375,6 @@ static void reads_init_connections(sh2_context_t *ctx) {
     }
 
     cidx->idx = conn_idx;
-    cidx->state = SH2_CONN_ACTIVE;
 
     sh2_conn_t *conn = &ctx->conns[conn_idx];
     *conn = (sh2_conn_t){
@@ -371,23 +383,184 @@ static void reads_init_connections(sh2_context_t *ctx) {
         .last_active_poll = ctx->poll_count,
     };
 
-    if (sh2_nghttp2_session_create(ctx, conn_idx) != sh2_ok) {
-      SH2_CHECK(shift_entity_destroy_one(sh, conns[i].entity),
-                "destroy conn_entity (session fail)");
-      SH2_CHECK(shift_entity_destroy_one(sh, user_conn),
-                "destroy user_conn (session fail)");
+#ifdef SH2_HAS_TLS
+    if (ctx->tls_config) {
+      /* TLS mode: create SSL object, start handshake */
+      if (sh2_tls_conn_create(ctx, conn_idx) != sh2_ok) {
+        SH2_CHECK(shift_entity_destroy_one(sh, conns[i].entity),
+                  "destroy conn_entity (tls fail)");
+        SH2_CHECK(shift_entity_destroy_one(sh, user_conn),
+                  "destroy user_conn (tls fail)");
+        SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                  "destroy read entity (tls fail)");
+        *conn = (sh2_conn_t){0};
+        cidx->state = SH2_CONN_NEW;
+        continue;
+      }
+      cidx->state = SH2_CONN_TLS_HANDSHAKE;
+      SH2_CHECK(shift_entity_move_one(sh, entities[i], ctx->coll_read_handshake),
+                "init → tls_handshake");
+    } else
+#endif
+    {
+      /* h2c mode: create nghttp2 session directly */
+      cidx->state = SH2_CONN_ACTIVE;
+
+      if (sh2_nghttp2_session_create(ctx, conn_idx) != sh2_ok) {
+        SH2_CHECK(shift_entity_destroy_one(sh, conns[i].entity),
+                  "destroy conn_entity (session fail)");
+        SH2_CHECK(shift_entity_destroy_one(sh, user_conn),
+                  "destroy user_conn (session fail)");
+        SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                  "destroy read entity (session fail)");
+        *conn = (sh2_conn_t){0};
+        cidx->state = SH2_CONN_NEW;
+        continue;
+      }
+
+      /* move to active for data feeding */
+      SH2_CHECK(shift_entity_move_one(sh, entities[i], ctx->coll_read_active),
+                "init → active");
+    }
+  }
+}
+
+#ifdef SH2_HAS_TLS
+/* Pass 3.5: Drive TLS handshakes */
+static void reads_tls_handshake(sh2_context_t *ctx) {
+  shift_t *sh = ctx->shift;
+  const sio_collection_ids_t *sio_colls = sio_get_collection_ids(ctx->sio);
+
+  shift_entity_t *entities = NULL;
+  sio_read_buf_t *rbufs = NULL;
+  sio_user_conn_entity_t *uconns = NULL;
+  size_t count = 0;
+
+  shift_collection_get_entities(sh, ctx->coll_read_handshake, &entities, &count);
+  if (count == 0)
+    return;
+
+  shift_collection_get_component_array(sh, ctx->coll_read_handshake,
+                                       ctx->sio_comp_ids.read_buf,
+                                       (void **)&rbufs, NULL);
+  shift_collection_get_component_array(sh, ctx->coll_read_handshake,
+                                       ctx->sio_comp_ids.user_conn_entity,
+                                       (void **)&uconns, NULL);
+
+  for (size_t i = 0; i < count; i++) {
+    shift_entity_t user_conn = uconns[i].entity;
+
+    sh2_conn_idx_t *cidx = NULL;
+    SH2_CHECK(shift_entity_get_component(sh, user_conn, ctx->internal_conn_idx,
+                                          (void **)&cidx),
+              "get conn_idx (tls_handshake)");
+
+    sh2_conn_t *conn = &ctx->conns[cidx->idx];
+    sh2_tls_conn_t *tconn = conn->tls;
+    if (!tconn) {
       SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
-                "destroy read entity (session fail)");
-      *conn = (sh2_conn_t){0};
-      cidx->state = SH2_CONN_NEW;
+                "destroy read entity (no tls)");
       continue;
     }
 
-    /* move to active for data feeding */
-    SH2_CHECK(shift_entity_move_one(sh, entities[i], ctx->coll_read_active),
-              "init → active");
+    /* stack buffer for any decrypted data after handshake completes */
+    uint8_t decrypt_buf[65536];
+    uint32_t decrypt_len = 0;
+
+    sh2_result_t r = sh2_tls_feed(ctx, cidx->idx,
+                                   rbufs[i].data, rbufs[i].len,
+                                   decrypt_buf, sizeof(decrypt_buf),
+                                   &decrypt_len);
+
+    /* drain handshake output (ServerHello, etc.) to sio write */
+    uint32_t wbio_len = 0;
+    uint8_t *wbio_data = sh2_tls_drain_wbio(ctx, cidx->idx, &wbio_len);
+    if (wbio_data && wbio_len > 0) {
+      shift_entity_t we;
+      SH2_CHECK(shift_entity_create_one_begin(sh, sio_colls->write_in, &we),
+                "create write entity (handshake)");
+
+      sio_write_buf_t *wb = NULL;
+      SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.write_buf,
+                                            (void **)&wb),
+                "get write_buf (handshake)");
+      wb->data   = wbio_data;
+      wb->len    = wbio_len;
+      wb->offset = 0;
+
+      sio_conn_entity_t *ce = NULL;
+      SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.conn_entity,
+                                            (void **)&ce),
+                "get conn_entity (handshake write)");
+      ce->entity = conn->conn_entity;
+
+      sio_user_conn_entity_t *uce = NULL;
+      SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.user_conn_entity,
+                                            (void **)&uce),
+                "get user_conn_entity (handshake write)");
+      uce->entity = conn->user_conn_entity;
+
+      SH2_CHECK(shift_entity_create_one_end(sh, we), "create_end write entity (handshake)");
+      conn->pending_writes++;
+    }
+
+    if (r != sh2_ok) {
+      /* handshake failed — close connection */
+      sh2_conn_close(ctx, cidx->idx);
+      SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                "destroy read entity (handshake fail)");
+      continue;
+    }
+
+    if (tconn->handshake_done) {
+      /* verify ALPN selected h2 */
+      const unsigned char *alpn = NULL;
+      unsigned int alpn_len = 0;
+      SSL_get0_alpn_selected(tconn->ssl, &alpn, &alpn_len);
+      if (alpn_len != 2 || alpn[0] != 'h' || alpn[1] != '2') {
+        SH2_DBG("[tls] ALPN negotiation failed: no h2\n");
+        sh2_conn_close(ctx, cidx->idx);
+        SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                  "destroy read entity (no alpn h2)");
+        continue;
+      }
+
+      /* transition to ACTIVE, create nghttp2 session */
+      cidx->state = SH2_CONN_ACTIVE;
+
+      if (sh2_nghttp2_session_create(ctx, cidx->idx) != sh2_ok) {
+        sh2_conn_close(ctx, cidx->idx);
+        SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                  "destroy read entity (session fail after handshake)");
+        continue;
+      }
+
+      /* feed any decrypted data from the same segment to nghttp2 */
+      if (decrypt_len > 0) {
+        nghttp2_ssize consumed =
+            nghttp2_session_mem_recv(conn->ng_session, decrypt_buf, decrypt_len);
+        if (consumed < 0) {
+          sh2_conn_close(ctx, cidx->idx);
+          SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                    "destroy read entity (recv error after handshake)");
+          continue;
+        }
+      }
+
+      conn->last_active_poll = ctx->poll_count;
+
+      /* recycle read buffer into active flow */
+      SH2_CHECK(shift_entity_move_one(sh, entities[i], sio_colls->read_in),
+                "recycle read buffer (handshake done)");
+    } else {
+      /* handshake needs more data — recycle read buffer */
+      conn->last_active_poll = ctx->poll_count;
+      SH2_CHECK(shift_entity_move_one(sh, entities[i], sio_colls->read_in),
+                "recycle read buffer (handshake continue)");
+    }
   }
 }
+#endif /* SH2_HAS_TLS */
 
 /* Pass 4: Feed active data to nghttp2 */
 static void reads_feed_data(sh2_context_t *ctx) {
@@ -426,14 +599,46 @@ static void reads_feed_data(sh2_context_t *ctx) {
       continue;
     }
 
-    nghttp2_ssize consumed =
-        nghttp2_session_mem_recv(conn->ng_session, rbufs[i].data, rbufs[i].len);
+#ifdef SH2_HAS_TLS
+    if (conn->tls) {
+      /* TLS: decrypt raw TCP → plaintext → nghttp2 */
+      uint8_t decrypt_buf[65536];
+      uint32_t decrypt_len = 0;
 
-    if (consumed < 0) {
-      sh2_conn_close(ctx, cidx->idx);
-      SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
-                "destroy read entity (recv error)");
-      continue;
+      sh2_result_t r = sh2_tls_feed(ctx, cidx->idx,
+                                     rbufs[i].data, rbufs[i].len,
+                                     decrypt_buf, sizeof(decrypt_buf),
+                                     &decrypt_len);
+      if (r != sh2_ok) {
+        sh2_conn_close(ctx, cidx->idx);
+        SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                  "destroy read entity (tls decrypt error)");
+        continue;
+      }
+
+      if (decrypt_len > 0) {
+        nghttp2_ssize consumed =
+            nghttp2_session_mem_recv(conn->ng_session, decrypt_buf, decrypt_len);
+        if (consumed < 0) {
+          sh2_conn_close(ctx, cidx->idx);
+          SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                    "destroy read entity (recv error)");
+          continue;
+        }
+      }
+    } else
+#endif
+    {
+      /* h2c: feed raw TCP directly to nghttp2 */
+      nghttp2_ssize consumed =
+          nghttp2_session_mem_recv(conn->ng_session, rbufs[i].data, rbufs[i].len);
+
+      if (consumed < 0) {
+        sh2_conn_close(ctx, cidx->idx);
+        SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                  "destroy read entity (recv error)");
+        continue;
+      }
     }
 
     conn->last_active_poll = ctx->poll_count;
@@ -565,6 +770,14 @@ sh2_result_t sh2_poll(sh2_context_t *ctx, uint32_t min_complete) {
   /* read pass 3: init new connections, move to active */
   reads_init_connections(ctx);
   SH2_CHECK(shift_flush(ctx->shift), "shift_flush");
+
+#ifdef SH2_HAS_TLS
+  /* read pass 3.5: drive TLS handshakes */
+  if (ctx->tls_config) {
+    reads_tls_handshake(ctx);
+    SH2_CHECK(shift_flush(ctx->shift), "shift_flush");
+  }
+#endif
 
   /* read pass 4: feed active data to nghttp2 */
   reads_feed_data(ctx);

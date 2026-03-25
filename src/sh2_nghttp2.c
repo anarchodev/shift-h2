@@ -168,6 +168,18 @@ static void stream_emit_request(sh2_context_t *ctx, sh2_stream_t *stream,
     stream->body_len  = 0;
     stream->body_cap  = 0;
 
+    /* domain_tag — propagate from per-connection TLS state */
+    sh2_domain_tag_t *dt = NULL;
+    SH2_CHECK(shift_entity_get_component(sh, entity, ctx->comp_ids.domain_tag,
+                                          (void **)&dt),
+              "get domain_tag component");
+#ifdef SH2_HAS_TLS
+    dt->tag = ctx->conns[stream->conn_idx].tls
+            ? ctx->conns[stream->conn_idx].tls->domain_tag : 0;
+#else
+    dt->tag = 0;
+#endif
+
     SH2_CHECK(shift_entity_create_end(sh, &entity, 1), "create_end request entity");
 
     stream->entity  = entity;
@@ -410,53 +422,109 @@ void sh2_nghttp2_session_destroy(sh2_context_t *ctx, uint32_t conn_idx) {
     conn->ng_ctx = NULL;
 }
 
+/* Helper: submit a sio write entity with the given data buffer (takes ownership) */
+static sh2_result_t submit_write(sh2_context_t *ctx, uint32_t conn_idx,
+                                  void *data, uint32_t len) {
+    sh2_conn_t *conn = &ctx->conns[conn_idx];
+    shift_t *sh = ctx->shift;
+    const sio_collection_ids_t *sio_colls = sio_get_collection_ids(ctx->sio);
+
+    shift_entity_t we;
+    SH2_CHECK(shift_entity_create_one_begin(sh, sio_colls->write_in, &we),
+              "create write entity");
+
+    sio_write_buf_t *wb = NULL;
+    SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.write_buf,
+                                          (void **)&wb),
+              "get write_buf component");
+    wb->data   = data;
+    wb->len    = len;
+    wb->offset = 0;
+
+    sio_conn_entity_t *ce = NULL;
+    SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.conn_entity,
+                                          (void **)&ce),
+              "get conn_entity component (write)");
+    ce->entity = conn->conn_entity;
+
+    sio_user_conn_entity_t *uce = NULL;
+    SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.user_conn_entity,
+                                          (void **)&uce),
+              "get user_conn_entity component (write)");
+    uce->entity = conn->user_conn_entity;
+
+    SH2_CHECK(shift_entity_create_one_end(sh, we), "create_end write entity");
+    conn->pending_writes++;
+    return sh2_ok;
+}
+
 sh2_result_t sh2_drive_send(sh2_context_t *ctx, uint32_t conn_idx) {
     sh2_conn_t *conn = &ctx->conns[conn_idx];
     if (!conn->ng_session)
         return sh2_ok;
 
     shift_t *sh = ctx->shift;
-    const sio_collection_ids_t *sio_colls = sio_get_collection_ids(ctx->sio);
 
-    for (;;) {
-        const uint8_t *data;
-        nghttp2_ssize len = nghttp2_session_mem_send(conn->ng_session, &data);
-        if (len < 0)
-            return sh2_error_io;
-        if (len == 0)
-            break;
+#ifdef SH2_HAS_TLS
+    if (conn->tls) {
+        /* TLS mode: accumulate all nghttp2 output, then encrypt as one chunk */
+        uint8_t *accum = NULL;
+        size_t accum_len = 0;
+        size_t accum_cap = 0;
 
-        /* copy data — nghttp2 buffer is only valid until next session call */
-        void *copy = malloc((size_t)len);
-        if (!copy) return sh2_error_oom;
-        memcpy(copy, data, (size_t)len);
+        for (;;) {
+            const uint8_t *data;
+            nghttp2_ssize len = nghttp2_session_mem_send(conn->ng_session, &data);
+            if (len < 0) { free(accum); return sh2_error_io; }
+            if (len == 0) break;
 
-        shift_entity_t we;
-        SH2_CHECK(shift_entity_create_one_begin(sh, sio_colls->write_in, &we),
-                  "create write entity");
+            /* grow accumulation buffer */
+            if (accum_len + (size_t)len > accum_cap) {
+                size_t new_cap = accum_cap ? accum_cap * 2 : 16384;
+                while (new_cap < accum_len + (size_t)len) new_cap *= 2;
+                uint8_t *nb = realloc(accum, new_cap);
+                if (!nb) { free(accum); return sh2_error_oom; }
+                accum = nb;
+                accum_cap = new_cap;
+            }
+            memcpy(accum + accum_len, data, (size_t)len);
+            accum_len += (size_t)len;
+        }
 
-        sio_write_buf_t *wb = NULL;
-        SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.write_buf,
-                                              (void **)&wb),
-                  "get write_buf component");
-        wb->data   = copy;
-        wb->len    = (uint32_t)len;
-        wb->offset = 0;
+        if (accum_len > 0) {
+            uint8_t *cipher = NULL;
+            uint32_t cipher_len = 0;
+            sh2_result_t r = sh2_tls_encrypt(ctx, conn_idx, accum, (uint32_t)accum_len,
+                                              &cipher, &cipher_len);
+            free(accum);
+            if (r != sh2_ok) return r;
 
-        sio_conn_entity_t *ce = NULL;
-        SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.conn_entity,
-                                              (void **)&ce),
-                  "get conn_entity component (write)");
-        ce->entity = conn->conn_entity;
+            if (cipher && cipher_len > 0) {
+                r = submit_write(ctx, conn_idx, cipher, cipher_len);
+                if (r != sh2_ok) { free(cipher); return r; }
+            }
+        } else {
+            free(accum);
+        }
+    } else
+#endif
+    {
+        /* h2c mode: send plaintext directly */
+        for (;;) {
+            const uint8_t *data;
+            nghttp2_ssize len = nghttp2_session_mem_send(conn->ng_session, &data);
+            if (len < 0)
+                return sh2_error_io;
+            if (len == 0)
+                break;
 
-        sio_user_conn_entity_t *uce = NULL;
-        SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.user_conn_entity,
-                                              (void **)&uce),
-                  "get user_conn_entity component (write)");
-        uce->entity = conn->user_conn_entity;
+            void *copy = malloc((size_t)len);
+            if (!copy) return sh2_error_oom;
+            memcpy(copy, data, (size_t)len);
 
-        SH2_CHECK(shift_entity_create_one_end(sh, we), "create_end write entity");
-        conn->pending_writes++;
+            sh2_result_t r = submit_write(ctx, conn_idx, copy, (uint32_t)len);
+            if (r != sh2_ok) { free(copy); return r; }
+        }
     }
 
     /* check if session is done — defer fd close until writes complete */
@@ -491,7 +559,11 @@ sh2_result_t sh2_drive_send(sh2_context_t *ctx, uint32_t conn_idx) {
 
 void sh2_conn_close(sh2_context_t *ctx, uint32_t conn_idx) {
     sh2_conn_t *conn = &ctx->conns[conn_idx];
-    if (!conn->ng_session && !conn->draining) return;
+    if (!conn->ng_session && !conn->draining
+#ifdef SH2_HAS_TLS
+        && !conn->tls
+#endif
+       ) return;
 
     shift_t *sh = ctx->shift;
 
@@ -503,6 +575,10 @@ void sh2_conn_close(sh2_context_t *ctx, uint32_t conn_idx) {
                   "get conn_idx (conn_close)");
         cidx->state = SH2_CONN_CLOSED;
     }
+
+#ifdef SH2_HAS_TLS
+    sh2_tls_conn_destroy(ctx, conn_idx);
+#endif
 
     sh2_nghttp2_session_destroy(ctx, conn_idx);
 
