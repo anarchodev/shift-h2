@@ -450,6 +450,14 @@ static void reads_tls_handshake(sh2_context_t *ctx) {
   for (size_t i = 0; i < count; i++) {
     shift_entity_t user_conn = uconns[i].entity;
 
+    /* connection already torn down */
+    if (shift_entity_is_stale(sh, user_conn) ||
+        shift_entity_is_moving(sh, user_conn)) {
+      SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                "destroy read entity (handshake stale)");
+      continue;
+    }
+
     sh2_conn_idx_t *cidx = NULL;
     SH2_CHECK(shift_entity_get_component(sh, user_conn, ctx->internal_conn_idx,
                                           (void **)&cidx),
