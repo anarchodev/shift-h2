@@ -253,7 +253,6 @@ sh2_result_t sh2_tls_feed(sh2_context_t *ctx, uint32_t conn_idx,
             int err = SSL_get_error(tconn->ssl, ret);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
                 return sh2_ok; /* need more TCP data */
-            SH2_DBG("[tls] handshake failed: ssl_err=%d\n", err);
             return sh2_error_io;
         }
     }
@@ -272,7 +271,6 @@ sh2_result_t sh2_tls_feed(sh2_context_t *ctx, uint32_t conn_idx,
         int err = SSL_get_error(tconn->ssl, n);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_ZERO_RETURN)
             break;
-        SH2_DBG("[tls] SSL_read failed: ssl_err=%d\n", err);
         return sh2_error_io;
     }
     *out_len = total;

@@ -6,12 +6,6 @@
 #include <stdbool.h>
 #include <stdio.h>
 
-#ifdef NDEBUG
-  #define SH2_DBG(...) ((void)0)
-#else
-  #define SH2_DBG(...) fprintf(stderr, __VA_ARGS__)
-#endif
-
 /* --------------------------------------------------------------------------
  * Internal connection index component (on sio connection_results entities)
  * -------------------------------------------------------------------------- */

@@ -270,10 +270,6 @@ static void stream_finish(sh2_context_t *ctx, sh2_stream_t *stream,
               "move entity to result_out (stream_finish)");
 }
 
-static _Thread_local uint64_t g_stream_close_count = 0;
-static _Thread_local uint64_t g_stream_close_emitted = 0;
-static _Thread_local uint64_t g_stream_close_not_emitted = 0;
-
 static int on_stream_close(nghttp2_session *session, int32_t stream_id,
                            uint32_t error_code, void *user_data) {
     sh2_ng_ctx_t *nctx = user_data;
@@ -281,22 +277,10 @@ static int on_stream_close(nghttp2_session *session, int32_t stream_id,
         session, stream_id);
     if (!stream) return 0;
 
-    g_stream_close_count++;
-
     if (stream->emitted) {
-        g_stream_close_emitted++;
         /* if send isn't complete, treat as error regardless of error_code */
         uint32_t ec = stream->send_complete ? error_code : (error_code ? error_code : 1);
         stream_finish(nctx->ctx, stream, ec);
-    } else {
-        g_stream_close_not_emitted++;
-    }
-
-    if (g_stream_close_count % 10000 == 0) {
-        SH2_DBG("[stream_close] total=%lu emitted=%lu not_emitted=%lu\n",
-                (unsigned long)g_stream_close_count,
-                (unsigned long)g_stream_close_emitted,
-                (unsigned long)g_stream_close_not_emitted);
     }
 
     nghttp2_session_set_stream_user_data(session, stream_id, NULL);
@@ -390,30 +374,18 @@ void sh2_nghttp2_session_destroy(sh2_context_t *ctx, uint32_t conn_idx) {
     /* Terminate session — this causes nghttp2 to mark all open streams
      * as closed, firing on_stream_close callbacks during the next
      * mem_send so entities move to response_result_out. */
-    {
-        size_t before = 0;
-        shift_entity_t *tmp = NULL;
-        shift_collection_get_entities(ctx->shift, ctx->coll_response_sending,
-                                      &tmp, &before);
-        nghttp2_session_terminate_session(conn->ng_session, NGHTTP2_NO_ERROR);
+    nghttp2_session_terminate_session(conn->ng_session, NGHTTP2_NO_ERROR);
 
-        /* Drive the session to flush stream close callbacks */
-        for (;;) {
-            const uint8_t *data;
-            nghttp2_ssize len = nghttp2_session_mem_send(conn->ng_session, &data);
-            if (len <= 0) break;
-            /* discard output — connection is going away */
-        }
-
-        /* flush deferred moves from on_stream_close callbacks */
-        SH2_CHECK(shift_flush(ctx->shift), "shift_flush (session_destroy)");
-
-        size_t after = 0;
-        shift_collection_get_entities(ctx->shift, ctx->coll_response_sending,
-                                      &tmp, &after);
-        SH2_DBG("[session_destroy] conn=%u sending: %zu -> %zu (drained %zu)\n",
-                conn_idx, before, after, before - after);
+    /* Drive the session to flush stream close callbacks */
+    for (;;) {
+        const uint8_t *data;
+        nghttp2_ssize len = nghttp2_session_mem_send(conn->ng_session, &data);
+        if (len <= 0) break;
+        /* discard output — connection is going away */
     }
+
+    /* flush deferred moves from on_stream_close callbacks */
+    SH2_CHECK(shift_flush(ctx->shift), "shift_flush (session_destroy)");
 
     nghttp2_session_del(conn->ng_session);
     conn->ng_session = NULL;

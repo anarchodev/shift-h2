@@ -175,8 +175,6 @@ static void drive_all_sends(sh2_context_t *ctx) {
 
     /* evict idle connections — safety net for zombie sessions */
     if (ctx->poll_count - ctx->conns[i].last_active_poll > SH2_IDLE_POLL_THRESHOLD) {
-      SH2_DBG("[idle_evict] conn=%u idle=%lu polls\n",
-              i, (unsigned long)(ctx->poll_count - ctx->conns[i].last_active_poll));
       sh2_conn_close(ctx, i);
       continue;
     }
@@ -191,10 +189,6 @@ static void drive_all_sends(sh2_context_t *ctx) {
       driven++;
     }
   }
-  static _Thread_local uint64_t call_count = 0;
-  call_count++;
-  if (driven > 0 && call_count % 1000 == 0)
-    SH2_DBG("[drive_all] driven=%u\n", driven);
 }
 
 /* --------------------------------------------------------------------------
@@ -518,7 +512,6 @@ static void reads_tls_handshake(sh2_context_t *ctx) {
       unsigned int alpn_len = 0;
       SSL_get0_alpn_selected(tconn->ssl, &alpn, &alpn_len);
       if (alpn_len != 2 || alpn[0] != 'h' || alpn[1] != '2') {
-        SH2_DBG("[tls] ALPN negotiation failed: no h2\n");
         sh2_conn_close(ctx, cidx->idx);
         SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
                   "destroy read entity (no alpn h2)");
@@ -744,13 +737,12 @@ sh2_result_t sh2_poll(sh2_context_t *ctx, uint32_t min_complete) {
   if (!ctx)
     return sh2_error_null;
 
-  static _Thread_local uint64_t last_active = 0;
-  uint64_t poll_count = ++ctx->poll_count;
+  ++ctx->poll_count;
 
   sio_result_t sr = sio_poll(ctx->sio, min_complete);
   if (sr != sio_ok) {
     fprintf(stderr, "[poll #%lu] sio_poll failed: %d\n",
-            (unsigned long)poll_count, sr);
+            (unsigned long)ctx->poll_count, sr);
     return sh2_error_io;
   }
 
@@ -800,70 +792,6 @@ sh2_result_t sh2_poll(sh2_context_t *ctx, uint32_t min_complete) {
    * single deferred move to response_result_out */
   drive_all_sends(ctx);
   SH2_CHECK(shift_flush(ctx->shift), "shift_flush");
-
-  /* periodic stats */
-  {
-    size_t n_resp_in = 0, n_read_res = 0, n_write_res = 0;
-    size_t n_req_out = 0, n_sending = 0, n_result = 0;
-    size_t n_read_in = 0, n_write_in = 0;
-    size_t n_read_err = 0, n_read_init = 0, n_read_active = 0;
-    shift_entity_t *tmp = NULL;
-    const sio_collection_ids_t *dbg_sio = sio_get_collection_ids(ctx->sio);
-    shift_collection_get_entities(ctx->shift, ctx->coll_ids.response_in, &tmp, &n_resp_in);
-    shift_collection_get_entities(ctx->shift, ctx->sio_read_results, &tmp, &n_read_res);
-    shift_collection_get_entities(ctx->shift, ctx->sio_write_results, &tmp, &n_write_res);
-    shift_collection_get_entities(ctx->shift, ctx->coll_ids.request_out, &tmp, &n_req_out);
-    shift_collection_get_entities(ctx->shift, ctx->coll_response_sending, &tmp, &n_sending);
-    shift_collection_get_entities(ctx->shift, ctx->coll_ids.response_result_out, &tmp, &n_result);
-    shift_collection_get_entities(ctx->shift, dbg_sio->read_in, &tmp, &n_read_in);
-    shift_collection_get_entities(ctx->shift, dbg_sio->write_in, &tmp, &n_write_in);
-    shift_collection_get_entities(ctx->shift, ctx->coll_read_errors, &tmp, &n_read_err);
-    shift_collection_get_entities(ctx->shift, ctx->coll_read_init, &tmp, &n_read_init);
-    shift_collection_get_entities(ctx->shift, ctx->coll_read_active, &tmp, &n_read_active);
-
-    size_t n_conns_coll = 0;
-    shift_collection_get_entities(ctx->shift, dbg_sio->connections, &tmp, &n_conns_coll);
-
-    /* count entities across ALL collections (including sio-internal) */
-    size_t n_total_entities = 0;
-    size_t n_collections = shift_collection_count(ctx->shift);
-    for (size_t c = 1; c < n_collections; c++) {
-      n_total_entities += shift_collection_entity_count(ctx->shift, (shift_collection_id_t){(uint32_t)c});
-    }
-
-    size_t tracked = n_resp_in + n_read_res + n_write_res + n_req_out +
-                     n_sending + n_result + n_read_in + n_write_in +
-                     n_read_err + n_read_init + n_read_active + n_conns_coll;
-    if (tracked > 0) last_active = poll_count;
-
-    uint32_t active = 0, pending_wr = 0;
-    uint32_t want_r = 0, want_w = 0;
-    for (uint32_t i = 0; i < ctx->max_connections; i++) {
-      if (ctx->conns[i].ng_session) {
-        active++;
-        if (nghttp2_session_want_read(ctx->conns[i].ng_session)) want_r++;
-        if (nghttp2_session_want_write(ctx->conns[i].ng_session)) want_w++;
-      }
-      pending_wr += ctx->conns[i].pending_writes;
-    }
-
-    /* log every 10000 polls, or if idle for 5000 polls with active conns */
-    if (poll_count % 10000 == 0 ||
-        (active > 0 && poll_count - last_active > 5000 && poll_count % 1000 == 0)) {
-      SH2_DBG(
-        "[poll #%lu] rd_res=%zu rd_err=%zu rd_init=%zu rd_act=%zu "
-        "rd_in=%zu wr_res=%zu wr_in=%zu | resp_in=%zu req_out=%zu "
-        "sending=%zu result=%zu | sio_conns=%zu total_ent=%zu "
-        "| conns=%u pend_wr=%u want_r=%u want_w=%u idle=%lu\n",
-        (unsigned long)poll_count,
-        n_read_res, n_read_err, n_read_init, n_read_active,
-        n_read_in, n_write_res, n_write_in,
-        n_resp_in, n_req_out, n_sending, n_result,
-        n_conns_coll, n_total_entities,
-        active, pending_wr, want_r, want_w,
-        (unsigned long)(poll_count - last_active));
-    }
-  }
 
   return sh2_ok;
 }
