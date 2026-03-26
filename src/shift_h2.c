@@ -38,6 +38,10 @@ static void resp_headers_dtor(shift_t *ctx, shift_collection_id_t col_id,
     (void)ctx; (void)col_id; (void)entities; (void)user_data;
     sh2_resp_headers_t *hdrs = (sh2_resp_headers_t *)data + offset;
     for (uint32_t i = 0; i < count; i++) {
+        for (uint32_t h = 0; h < hdrs[i].count; h++) {
+            free((void *)hdrs[i].fields[h].name);
+            free((void *)hdrs[i].fields[h].value);
+        }
         free(hdrs[i].fields);
         hdrs[i].fields = NULL;
         hdrs[i].count  = 0;
