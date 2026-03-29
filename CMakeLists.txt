@@ -37,6 +37,7 @@ option(ENABLE_TLS "Enable TLS support via OpenSSL" ON)
 add_library(shift_h2 STATIC
     src/shift_h2.c
     src/sh2_nghttp2.c
+    src/sh2_nghttp2_client.c
     src/sh2_poll.c
 )
 target_include_directories(shift_h2

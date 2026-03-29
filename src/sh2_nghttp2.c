@@ -18,13 +18,13 @@
  * Stream helpers
  * -------------------------------------------------------------------------- */
 
-static sh2_stream_t *stream_alloc(uint32_t conn_idx) {
+sh2_stream_t *sh2_stream_alloc(uint32_t conn_idx) {
     sh2_stream_t *s = calloc(1, sizeof(*s));
     if (s) s->conn_idx = conn_idx;
     return s;
 }
 
-static void stream_free(sh2_stream_t *s) {
+void sh2_stream_free(sh2_stream_t *s) {
     if (!s) return;
     free(s->hdr_fields);
     free(s->hdr_strbuf);
@@ -32,7 +32,7 @@ static void stream_free(sh2_stream_t *s) {
     free(s);
 }
 
-static bool stream_hdr_append(sh2_stream_t *s,
+bool sh2_stream_hdr_append(sh2_stream_t *s,
                               const uint8_t *name,  size_t namelen,
                               const uint8_t *value, size_t valuelen) {
     /* grow fields array */
@@ -78,7 +78,7 @@ static bool stream_hdr_append(sh2_stream_t *s,
 /* Bake offset-based header fields into a single contiguous allocation.
  * Returns the fields array (with embedded string data after the fields).
  * Caller takes ownership. */
-static sh2_header_field_t *stream_hdr_finalize(sh2_stream_t *s,
+sh2_header_field_t *sh2_stream_hdr_finalize(sh2_stream_t *s,
                                                 uint32_t *out_count) {
     uint32_t n = s->hdr_count;
     size_t fields_size = n * sizeof(sh2_header_field_t);
@@ -105,7 +105,7 @@ static sh2_header_field_t *stream_hdr_finalize(sh2_stream_t *s,
     return result;
 }
 
-static bool stream_body_append(sh2_stream_t *s,
+bool sh2_stream_body_append(sh2_stream_t *s,
                                const uint8_t *data, size_t len) {
     while (s->body_len + len > s->body_cap) {
         uint32_t new_cap = s->body_cap ? s->body_cap * 2 : 4096;
@@ -148,7 +148,7 @@ static void stream_emit_request(sh2_context_t *ctx, sh2_stream_t *stream,
 
     /* req_headers — finalize and transfer ownership */
     uint32_t hdr_count = 0;
-    sh2_header_field_t *fields = stream_hdr_finalize(stream, &hdr_count);
+    sh2_header_field_t *fields = sh2_stream_hdr_finalize(stream, &hdr_count);
 
     sh2_req_headers_t *rh = NULL;
     SH2_CHECK(shift_entity_get_component(sh, entity, ctx->comp_ids.req_headers,
@@ -197,7 +197,7 @@ static int on_begin_headers(nghttp2_session *session,
         return 0;
 
     sh2_ng_ctx_t *nctx = user_data;
-    sh2_stream_t *stream = stream_alloc(nctx->conn_idx);
+    sh2_stream_t *stream = sh2_stream_alloc(nctx->conn_idx);
     if (!stream)
         return NGHTTP2_ERR_CALLBACK_FAILURE;
 
@@ -217,7 +217,7 @@ static int on_header(nghttp2_session *session, const nghttp2_frame *frame,
         session, frame->hd.stream_id);
     if (!stream) return 0;
 
-    if (!stream_hdr_append(stream, name, namelen, value, valuelen))
+    if (!sh2_stream_hdr_append(stream, name, namelen, value, valuelen))
         return NGHTTP2_ERR_CALLBACK_FAILURE;
 
     return 0;
@@ -231,7 +231,7 @@ static int on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
         session, stream_id);
     if (!stream) return 0;
 
-    if (!stream_body_append(stream, data, len))
+    if (!sh2_stream_body_append(stream, data, len))
         return NGHTTP2_ERR_CALLBACK_FAILURE;
 
     return 0;
@@ -284,7 +284,7 @@ static int on_stream_close(nghttp2_session *session, int32_t stream_id,
     }
 
     nghttp2_session_set_stream_user_data(session, stream_id, NULL);
-    stream_free(stream);
+    sh2_stream_free(stream);
     return 0;
 }
 
@@ -522,6 +522,7 @@ sh2_result_t sh2_drive_send(sh2_context_t *ctx, uint32_t conn_idx) {
             if (!shift_entity_is_stale(sh, conn->user_conn_entity))
                 SH2_CHECK(shift_entity_destroy_one(sh, conn->user_conn_entity),
                           "destroy user_conn_entity (drive_send)");
+            free(conn->hostname);
             *conn = (sh2_conn_t){0};
         }
     }
@@ -562,6 +563,7 @@ void sh2_conn_close(sh2_context_t *ctx, uint32_t conn_idx) {
         SH2_CHECK(shift_entity_destroy_one(sh, conn->user_conn_entity),
                   "destroy user_conn_entity (conn_close)");
 
+    free(conn->hostname);
     *conn = (sh2_conn_t){0};
 }
 

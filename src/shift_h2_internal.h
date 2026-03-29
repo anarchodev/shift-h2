@@ -12,13 +12,17 @@
 
 typedef struct {
     uint32_t idx;
-    uint8_t  state; /* SH2_CONN_* */
+    uint8_t  state;     /* SH2_CONN_* */
+    uint8_t  direction; /* SH2_DIR_* */
 } sh2_conn_idx_t;
 
 #define SH2_CONN_NEW            0
 #define SH2_CONN_ACTIVE         1
 #define SH2_CONN_CLOSED         2
 #define SH2_CONN_TLS_HANDSHAKE  3
+
+#define SH2_DIR_SERVER          0
+#define SH2_DIR_CLIENT          1
 
 /* --------------------------------------------------------------------------
  * Per-connection state
@@ -38,6 +42,7 @@ typedef struct {
     uint32_t           pending_writes;   /* outstanding write entities */
     bool               draining;         /* session done, waiting for writes */
     uint64_t           last_active_poll; /* poll tick of last activity */
+    char              *hostname;        /* client connections: target hostname (owned) */
 #ifdef SH2_HAS_TLS
     sh2_tls_conn_t    *tls;             /* NULL for h2c connections */
 #endif
@@ -61,6 +66,7 @@ typedef struct {
     shift_entity_t      entity;
     bool                emitted;
     bool                send_complete;
+    uint16_t            response_status; /* parsed :status for client mode */
 } sh2_stream_t;
 
 /* --------------------------------------------------------------------------
@@ -118,9 +124,24 @@ struct sh2_context {
     uint64_t                    poll_count;
 
 #ifdef SH2_HAS_TLS
-    /* TLS state */
+    /* TLS state (server) */
     SSL_CTX                    *ssl_ctx;
     sh2_tls_config_t           *tls_config;     /* borrowed ref to user config */
     shift_collection_id_t       coll_read_handshake; /* TLS handshake data */
+#endif
+
+    /* client / outgoing connection support */
+    bool                        enable_connect;
+    sh2_client_collection_ids_t coll_ids_client;
+    shift_collection_id_t       sio_connect_results;
+    shift_collection_id_t       coll_client_request_sending;
+    shift_collection_id_t       coll_read_client_init;
+    shift_collection_id_t       coll_read_client_handshake;
+    nghttp2_session_callbacks  *ng_client_callbacks;
+
+#ifdef SH2_HAS_TLS
+    /* TLS state (client) */
+    SSL_CTX                    *ssl_client_ctx;
+    sh2_tls_client_config_t    *tls_client_config;
 #endif
 };

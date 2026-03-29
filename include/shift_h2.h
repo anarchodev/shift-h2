@@ -1,7 +1,9 @@
 #pragma once
 
 #include <shift.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <netinet/in.h>
 
 struct io_uring_params;
 
@@ -53,8 +55,9 @@ typedef struct {
     uint32_t len;
 } sh2_req_body_t;
 
-/* App allocates resp_headers; shift-h2 frees fields via component destructor
- * when the entity is destroyed.  The fields array must be malloc'd. */
+/* App allocates resp_headers; shift-h2 frees the fields array via component
+ * destructor when the entity is destroyed.  The fields array must be malloc'd.
+ * Name/value pointers are NOT freed — they may be literals or borrowed. */
 typedef struct {
     sh2_header_field_t *fields;
     uint32_t            count;
@@ -79,6 +82,13 @@ typedef struct {
     uint64_t tag; /* opaque tenant/domain identifier; 0 for h2c */
 } sh2_domain_tag_t;
 
+/* Target address + hostname for outgoing HTTP/2 connections */
+typedef struct {
+    struct sockaddr_in addr;
+    const char        *hostname;     /* for TLS SNI + :authority; borrowed, must outlive entity */
+    uint32_t           hostname_len;
+} sh2_connect_target_t;
+
 /* --------------------------------------------------------------------------
  * Registered IDs
  * -------------------------------------------------------------------------- */
@@ -93,6 +103,7 @@ typedef struct {
     shift_component_id_t status;
     shift_component_id_t io_result;
     shift_component_id_t domain_tag;
+    shift_component_id_t connect_target;
 } sh2_component_ids_t;
 
 typedef struct {
@@ -115,6 +126,30 @@ typedef struct {
      *   App frees resp_headers/resp_body memory and destroys entity. */
     shift_collection_id_t response_result_out;
 } sh2_collection_ids_t;
+
+/* Client (outgoing) collection IDs — only valid when enable_connect is true. */
+typedef struct {
+    /* connect_out: app creates entities with sh2_connect_target_t here to
+     *   initiate an outgoing TCP connection. */
+    shift_collection_id_t connect_out;
+
+    /* connect_result_out: connection established (io_result.error == 0) or
+     *   failed (io_result.error < 0).  On success, session.entity is set. */
+    shift_collection_id_t connect_result_out;
+
+    /* request_in: app deposits request-ready entities here.
+     *   Required components: {session, req_headers, req_body}.
+     *   req_headers must include :method, :path, :scheme, :authority. */
+    shift_collection_id_t request_in;
+
+    /* response_out: completed response entities delivered here.
+     *   Components: {stream_id, session, resp_headers, resp_body, status}. */
+    shift_collection_id_t response_out;
+
+    /* response_result_out: stream fully closed — app destroys entity.
+     *   Components: same as response_out + io_result. */
+    shift_collection_id_t response_result_out;
+} sh2_client_collection_ids_t;
 
 /* --------------------------------------------------------------------------
  * TLS (optional — requires SH2_HAS_TLS at build time)
@@ -152,6 +187,34 @@ sh2_result_t sh2_tls_config_set_sni_callback(sh2_tls_config_t *cfg,
                                               sh2_sni_callback_t cb,
                                               void *user_data);
 
+/* Enable client certificate verification (mutual TLS) on the server.
+ * mode: SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, etc.
+ * ca_pem: PEM-encoded CA certificate(s) trusted for client certs. */
+sh2_result_t sh2_tls_config_set_client_verify(sh2_tls_config_t *cfg,
+                                               int verify_mode,
+                                               const char *ca_pem);
+
+/* ---------- Client TLS configuration (for outgoing connections) ---------- */
+
+typedef struct sh2_tls_client_config sh2_tls_client_config_t;
+
+sh2_result_t sh2_tls_client_config_create(sh2_tls_client_config_t **out);
+void         sh2_tls_client_config_destroy(sh2_tls_client_config_t *cfg);
+
+/* Set client certificate + key for mutual TLS presentation. */
+sh2_result_t sh2_tls_client_config_set_cert(sh2_tls_client_config_t *cfg,
+                                             const char *cert_pem,
+                                             const char *key_pem);
+
+/* Add CA certificate(s) for server verification.
+ * If not called, the default OpenSSL trust store is used. */
+sh2_result_t sh2_tls_client_config_add_ca(sh2_tls_client_config_t *cfg,
+                                           const char *ca_pem);
+
+/* Enable or disable server certificate verification (default: true). */
+sh2_result_t sh2_tls_client_config_set_verify(sh2_tls_client_config_t *cfg,
+                                               bool verify);
+
 #endif /* SH2_HAS_TLS */
 
 /* --------------------------------------------------------------------------
@@ -180,6 +243,15 @@ typedef struct {
      * with ALPN h2 negotiation and SNI-based certificate selection. */
     sh2_tls_config_t *tls;
 #endif
+    /* Client / outgoing connection support (optional).
+     * Set enable_connect = true and provide the five client collections
+     * to use sh2_connect() and the client request/response path. */
+    bool                        enable_connect;
+    sh2_client_collection_ids_t client_colls;
+#ifdef SH2_HAS_TLS
+    /* Client TLS — NULL = cleartext h2c for outgoing connections. */
+    sh2_tls_client_config_t    *tls_client;
+#endif
 } sh2_config_t;
 
 /* --------------------------------------------------------------------------
@@ -197,5 +269,12 @@ void         sh2_context_destroy(sh2_context_t *ctx);
 sh2_result_t sh2_listen(sh2_context_t *ctx, uint16_t port, int backlog);
 sh2_result_t sh2_poll(sh2_context_t *ctx, uint32_t min_complete);
 
-const sh2_component_ids_t  *sh2_get_component_ids(const sh2_context_t *ctx);
-const sh2_collection_ids_t *sh2_get_collection_ids(const sh2_context_t *ctx);
+const sh2_component_ids_t         *sh2_get_component_ids(const sh2_context_t *ctx);
+const sh2_collection_ids_t        *sh2_get_collection_ids(const sh2_context_t *ctx);
+const sh2_client_collection_ids_t *sh2_get_client_collection_ids(const sh2_context_t *ctx);
+
+/* Initiate an outgoing HTTP/2 connection.  Requires enable_connect.
+ * The connection result will appear in client_colls.connect_result_out. */
+sh2_result_t sh2_connect(sh2_context_t *ctx,
+                          const struct sockaddr_in *addr,
+                          const char *hostname, uint32_t hostname_len);

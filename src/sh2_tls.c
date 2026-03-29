@@ -31,6 +31,7 @@ void sh2_tls_config_destroy(sh2_tls_config_t *cfg) {
         EVP_PKEY_free(cfg->certs[i].key);
     }
     free(cfg->certs);
+    X509_STORE_free(cfg->client_ca_store);
     free(cfg);
 }
 
@@ -173,6 +174,12 @@ sh2_result_t sh2_tls_init(sh2_context_t *ctx) {
     if (tcfg->cert_count > 0) {
         SSL_CTX_use_certificate(ssl_ctx, tcfg->certs[0].cert);
         SSL_CTX_use_PrivateKey(ssl_ctx, tcfg->certs[0].key);
+    }
+
+    /* mTLS: client certificate verification */
+    if (tcfg->client_verify_mode != 0 && tcfg->client_ca_store) {
+        SSL_CTX_set_verify(ssl_ctx, tcfg->client_verify_mode, NULL);
+        SSL_CTX_set1_verify_cert_store(ssl_ctx, tcfg->client_ca_store);
     }
 
     ctx->ssl_ctx = ssl_ctx;
@@ -330,6 +337,201 @@ uint8_t *sh2_tls_drain_wbio(sh2_context_t *ctx, uint32_t conn_idx,
 
     *out_len = (uint32_t)n;
     return buf;
+}
+
+/* --------------------------------------------------------------------------
+ * Client TLS config API
+ * -------------------------------------------------------------------------- */
+
+sh2_result_t sh2_tls_client_config_create(sh2_tls_client_config_t **out) {
+    if (!out) return sh2_error_null;
+    sh2_tls_client_config_t *cfg = calloc(1, sizeof(*cfg));
+    if (!cfg) return sh2_error_oom;
+    cfg->verify_server = true;
+    *out = cfg;
+    return sh2_ok;
+}
+
+void sh2_tls_client_config_destroy(sh2_tls_client_config_t *cfg) {
+    if (!cfg) return;
+    X509_free(cfg->client_cert);
+    EVP_PKEY_free(cfg->client_key);
+    X509_STORE_free(cfg->ca_store);
+    free(cfg);
+}
+
+sh2_result_t sh2_tls_client_config_set_cert(sh2_tls_client_config_t *cfg,
+                                             const char *cert_pem,
+                                             const char *key_pem) {
+    if (!cfg || !cert_pem || !key_pem) return sh2_error_null;
+
+    BIO *cbio = BIO_new_mem_buf(cert_pem, -1);
+    if (!cbio) return sh2_error_oom;
+    X509 *cert = PEM_read_bio_X509(cbio, NULL, NULL, NULL);
+    BIO_free(cbio);
+    if (!cert) return sh2_error_invalid;
+
+    BIO *kbio = BIO_new_mem_buf(key_pem, -1);
+    if (!kbio) { X509_free(cert); return sh2_error_oom; }
+    EVP_PKEY *key = PEM_read_bio_PrivateKey(kbio, NULL, NULL, NULL);
+    BIO_free(kbio);
+    if (!key) { X509_free(cert); return sh2_error_invalid; }
+
+    if (!X509_check_private_key(cert, key)) {
+        X509_free(cert); EVP_PKEY_free(key);
+        return sh2_error_invalid;
+    }
+
+    X509_free(cfg->client_cert);
+    EVP_PKEY_free(cfg->client_key);
+    cfg->client_cert = cert;
+    cfg->client_key  = key;
+    return sh2_ok;
+}
+
+sh2_result_t sh2_tls_client_config_add_ca(sh2_tls_client_config_t *cfg,
+                                           const char *ca_pem) {
+    if (!cfg || !ca_pem) return sh2_error_null;
+
+    if (!cfg->ca_store) {
+        cfg->ca_store = X509_STORE_new();
+        if (!cfg->ca_store) return sh2_error_oom;
+    }
+
+    BIO *bio = BIO_new_mem_buf(ca_pem, -1);
+    if (!bio) return sh2_error_oom;
+
+    X509 *ca = NULL;
+    int added = 0;
+    while ((ca = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+        X509_STORE_add_cert(cfg->ca_store, ca);
+        X509_free(ca);
+        added++;
+    }
+    BIO_free(bio);
+    return added > 0 ? sh2_ok : sh2_error_invalid;
+}
+
+sh2_result_t sh2_tls_client_config_set_verify(sh2_tls_client_config_t *cfg,
+                                               bool verify) {
+    if (!cfg) return sh2_error_null;
+    cfg->verify_server = verify;
+    return sh2_ok;
+}
+
+/* --------------------------------------------------------------------------
+ * Client TLS context init / cleanup
+ * -------------------------------------------------------------------------- */
+
+sh2_result_t sh2_tls_client_init(sh2_context_t *ctx) {
+    sh2_tls_client_config_t *tcfg = ctx->tls_client_config;
+    if (!tcfg) return sh2_error_null;
+
+    SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_client_method());
+    if (!ssl_ctx) return sh2_error_oom;
+
+    SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
+
+    /* ALPN: advertise h2 */
+    static const unsigned char alpn[] = { 2, 'h', '2' };
+    SSL_CTX_set_alpn_protos(ssl_ctx, alpn, sizeof(alpn));
+
+    /* client certificate (for mTLS) */
+    if (tcfg->client_cert) {
+        SSL_CTX_use_certificate(ssl_ctx, tcfg->client_cert);
+        SSL_CTX_use_PrivateKey(ssl_ctx, tcfg->client_key);
+    }
+
+    /* CA trust store */
+    if (tcfg->ca_store) {
+        SSL_CTX_set1_verify_cert_store(ssl_ctx, tcfg->ca_store);
+    } else {
+        SSL_CTX_set_default_verify_paths(ssl_ctx);
+    }
+
+    /* server verification */
+    if (tcfg->verify_server) {
+        SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
+    }
+
+    ctx->ssl_client_ctx = ssl_ctx;
+    return sh2_ok;
+}
+
+void sh2_tls_client_cleanup(sh2_context_t *ctx) {
+    if (ctx->ssl_client_ctx) {
+        SSL_CTX_free(ctx->ssl_client_ctx);
+        ctx->ssl_client_ctx = NULL;
+    }
+}
+
+sh2_result_t sh2_tls_client_conn_create(sh2_context_t *ctx, uint32_t conn_idx,
+                                         const char *hostname) {
+    sh2_tls_conn_t *tconn = calloc(1, sizeof(*tconn));
+    if (!tconn) return sh2_error_oom;
+
+    tconn->ssl = SSL_new(ctx->ssl_client_ctx);
+    if (!tconn->ssl) { free(tconn); return sh2_error_oom; }
+
+    tconn->rbio = BIO_new(BIO_s_mem());
+    tconn->wbio = BIO_new(BIO_s_mem());
+    if (!tconn->rbio || !tconn->wbio) {
+        BIO_free(tconn->rbio);
+        BIO_free(tconn->wbio);
+        SSL_free(tconn->ssl);
+        free(tconn);
+        return sh2_error_oom;
+    }
+
+    SSL_set_bio(tconn->ssl, tconn->rbio, tconn->wbio);
+    SSL_set_connect_state(tconn->ssl);
+    SSL_set_app_data(tconn->ssl, tconn);
+
+    /* SNI hostname */
+    if (hostname)
+        SSL_set_tlsext_host_name(tconn->ssl, hostname);
+
+    /* hostname verification */
+    if (hostname && ctx->tls_client_config->verify_server)
+        SSL_set1_host(tconn->ssl, hostname);
+
+    ctx->conns[conn_idx].tls = tconn;
+    return sh2_ok;
+}
+
+/* --------------------------------------------------------------------------
+ * Server mTLS: client certificate verification
+ * -------------------------------------------------------------------------- */
+
+sh2_result_t sh2_tls_config_set_client_verify(sh2_tls_config_t *cfg,
+                                               int verify_mode,
+                                               const char *ca_pem) {
+    if (!cfg || !ca_pem) return sh2_error_null;
+
+    X509_STORE *store = X509_STORE_new();
+    if (!store) return sh2_error_oom;
+
+    BIO *bio = BIO_new_mem_buf(ca_pem, -1);
+    if (!bio) { X509_STORE_free(store); return sh2_error_oom; }
+
+    X509 *ca = NULL;
+    int added = 0;
+    while ((ca = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+        X509_STORE_add_cert(store, ca);
+        X509_free(ca);
+        added++;
+    }
+    BIO_free(bio);
+
+    if (added == 0) {
+        X509_STORE_free(store);
+        return sh2_error_invalid;
+    }
+
+    X509_STORE_free(cfg->client_ca_store);
+    cfg->client_verify_mode = verify_mode;
+    cfg->client_ca_store    = store;
+    return sh2_ok;
 }
 
 #endif /* SH2_HAS_TLS */

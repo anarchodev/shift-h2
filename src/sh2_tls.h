@@ -23,6 +23,17 @@ struct sh2_tls_config {
     uint32_t            cert_cap;
     sh2_sni_callback_t  sni_cb;
     void               *sni_user_data;
+    /* mTLS: client certificate verification */
+    int                 client_verify_mode;
+    X509_STORE         *client_ca_store;
+};
+
+/* Client-side TLS config (for outgoing connections) */
+struct sh2_tls_client_config {
+    X509       *client_cert;    /* NULL if no mTLS */
+    EVP_PKEY   *client_key;
+    X509_STORE *ca_store;       /* NULL = default trust store */
+    bool        verify_server;  /* default true */
 };
 
 /* Per-connection TLS state */
@@ -34,9 +45,17 @@ typedef struct {
     bool     handshake_done;
 } sh2_tls_conn_t;
 
-/* Context-level TLS init / cleanup */
+/* Context-level TLS init / cleanup (server) */
 sh2_result_t sh2_tls_init(sh2_context_t *ctx);
 void         sh2_tls_cleanup(sh2_context_t *ctx);
+
+/* Context-level TLS init / cleanup (client) */
+sh2_result_t sh2_tls_client_init(sh2_context_t *ctx);
+void         sh2_tls_client_cleanup(sh2_context_t *ctx);
+
+/* Per-connection client TLS lifecycle */
+sh2_result_t sh2_tls_client_conn_create(sh2_context_t *ctx, uint32_t conn_idx,
+                                         const char *hostname);
 
 /* Per-connection lifecycle */
 sh2_result_t sh2_tls_conn_create(sh2_context_t *ctx, uint32_t conn_idx);
