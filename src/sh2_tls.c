@@ -3,6 +3,7 @@
 #include "shift_h2_internal.h"
 
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <stdlib.h>
@@ -223,12 +224,90 @@ sh2_result_t sh2_tls_conn_create(sh2_context_t *ctx, uint32_t conn_idx) {
     return sh2_ok;
 }
 
+static void free_peer_cert(sh2_peer_cert_t *pc);
+
 void sh2_tls_conn_destroy(sh2_context_t *ctx, uint32_t conn_idx) {
     sh2_tls_conn_t *tconn = ctx->conns[conn_idx].tls;
     if (!tconn) return;
+    free_peer_cert(&tconn->peer_cert);
     SSL_free(tconn->ssl); /* also frees rbio and wbio */
     free(tconn);
     ctx->conns[conn_idx].tls = NULL;
+}
+
+/* --------------------------------------------------------------------------
+ * Extract peer certificate info after handshake
+ * -------------------------------------------------------------------------- */
+
+static char *x509_name_oneline(X509_NAME *name) {
+    if (!name) return NULL;
+    BIO *bio = BIO_new(BIO_s_mem());
+    if (!bio) return NULL;
+    X509_NAME_print_ex(bio, name, 0, XN_FLAG_ONELINE & ~ASN1_STRFLGS_ESC_MSB);
+    char *data = NULL;
+    long len = BIO_get_mem_data(bio, &data);
+    char *result = NULL;
+    if (len > 0 && data) {
+        result = malloc((size_t)len + 1);
+        if (result) { memcpy(result, data, (size_t)len); result[len] = '\0'; }
+    }
+    BIO_free(bio);
+    return result;
+}
+
+static char *x509_get_cn(X509 *cert) {
+    X509_NAME *subj = X509_get_subject_name(cert);
+    if (!subj) return NULL;
+    int idx = X509_NAME_get_index_by_NID(subj, NID_commonName, -1);
+    if (idx < 0) return NULL;
+    X509_NAME_ENTRY *entry = X509_NAME_get_entry(subj, idx);
+    if (!entry) return NULL;
+    ASN1_STRING *asn1 = X509_NAME_ENTRY_get_data(entry);
+    if (!asn1) return NULL;
+    const unsigned char *utf8 = NULL;
+    int len = ASN1_STRING_to_UTF8((unsigned char **)&utf8, asn1);
+    if (len < 0) return NULL;
+    char *result = malloc((size_t)len + 1);
+    if (result) { memcpy(result, utf8, (size_t)len); result[len] = '\0'; }
+    OPENSSL_free((void *)utf8);
+    return result;
+}
+
+static char *asn1_integer_to_hex(const ASN1_INTEGER *ai) {
+    BIGNUM *bn = ASN1_INTEGER_to_BN(ai, NULL);
+    if (!bn) return NULL;
+    char *hex = BN_bn2hex(bn);
+    BN_free(bn);
+    if (!hex) return NULL;
+    char *result = strdup(hex);
+    OPENSSL_free(hex);
+    return result;
+}
+
+static void extract_peer_cert(sh2_tls_conn_t *tconn) {
+    X509 *cert = SSL_get0_peer_certificate(tconn->ssl);
+    if (!cert) {
+        tconn->peer_cert.present = false;
+        return;
+    }
+
+    tconn->peer_cert.present    = true;
+    tconn->peer_cert.subject_cn = x509_get_cn(cert);
+    tconn->peer_cert.subject_dn = x509_name_oneline(X509_get_subject_name(cert));
+    tconn->peer_cert.issuer_dn  = x509_name_oneline(X509_get_issuer_name(cert));
+    tconn->peer_cert.serial_hex = asn1_integer_to_hex(X509_get0_serialNumber(cert));
+
+    /* SHA-256 fingerprint of DER-encoded cert */
+    unsigned int fprint_len = 0;
+    X509_digest(cert, EVP_sha256(), tconn->peer_cert.fingerprint_sha256, &fprint_len);
+}
+
+static void free_peer_cert(sh2_peer_cert_t *pc) {
+    free(pc->subject_cn);
+    free(pc->subject_dn);
+    free(pc->issuer_dn);
+    free(pc->serial_hex);
+    *pc = (sh2_peer_cert_t){0};
 }
 
 /* --------------------------------------------------------------------------
@@ -255,6 +334,7 @@ sh2_result_t sh2_tls_feed(sh2_context_t *ctx, uint32_t conn_idx,
         int ret = SSL_do_handshake(tconn->ssl);
         if (ret == 1) {
             tconn->handshake_done = true;
+            extract_peer_cert(tconn);
             /* fall through to SSL_read for any buffered app data */
         } else {
             int err = SSL_get_error(tconn->ssl, ret);

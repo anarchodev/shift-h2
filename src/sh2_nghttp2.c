@@ -180,6 +180,25 @@ static void stream_emit_request(sh2_context_t *ctx, sh2_stream_t *stream,
     dt->tag = 0;
 #endif
 
+    /* peer_cert — copy from per-connection TLS state (strings are strdup'd
+     * so the entity's copy is independent of the connection lifetime) */
+    sh2_peer_cert_t *pc = NULL;
+    SH2_CHECK(shift_entity_get_component(sh, entity, ctx->comp_ids.peer_cert,
+                                          (void **)&pc),
+              "get peer_cert component");
+#ifdef SH2_HAS_TLS
+    if (ctx->conns[stream->conn_idx].tls &&
+        ctx->conns[stream->conn_idx].tls->peer_cert.present) {
+        const sh2_peer_cert_t *src = &ctx->conns[stream->conn_idx].tls->peer_cert;
+        pc->present    = true;
+        pc->subject_cn = src->subject_cn ? strdup(src->subject_cn) : NULL;
+        pc->subject_dn = src->subject_dn ? strdup(src->subject_dn) : NULL;
+        pc->issuer_dn  = src->issuer_dn  ? strdup(src->issuer_dn)  : NULL;
+        pc->serial_hex = src->serial_hex ? strdup(src->serial_hex) : NULL;
+        memcpy(pc->fingerprint_sha256, src->fingerprint_sha256, 32);
+    }
+#endif
+
     SH2_CHECK(shift_entity_create_end(sh, &entity, 1), "create_end request entity");
 
     stream->entity  = entity;

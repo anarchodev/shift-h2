@@ -43,6 +43,8 @@ typedef struct {
     BIO     *wbio;          /* SSL_write() → raw TCP */
     uint64_t domain_tag;    /* set during SNI callback */
     bool     handshake_done;
+    /* peer certificate info — extracted once at handshake completion */
+    sh2_peer_cert_t peer_cert;
 } sh2_tls_conn_t;
 
 /* Context-level TLS init / cleanup (server) */

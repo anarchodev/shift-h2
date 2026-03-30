@@ -99,7 +99,7 @@ int main(int argc, char **argv) {
     shift_component_id_t all_comps[] = {
         comp.stream_id, comp.session, comp.req_headers, comp.req_body,
         comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
-        comp.domain_tag,
+        comp.domain_tag, comp.peer_cert,
     };
     shift_collection_id_t request_out, response_in, response_result_out;
     {
@@ -154,6 +154,14 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < count; i++) {
                 shift_entity_t e = entities[i];
 
+                /* inspect peer certificate */
+                sh2_peer_cert_t *pc = NULL;
+                shift_entity_get_component(sh, e, comp.peer_cert, (void **)&pc);
+                if (pc && pc->present) {
+                    printf("Request from: CN=%s\n",
+                           pc->subject_cn ? pc->subject_cn : "(none)");
+                }
+
                 sh2_header_field_t *resp_fields =
                     malloc(sizeof(sh2_header_field_t));
                 resp_fields[0] = (sh2_header_field_t){
@@ -166,10 +174,17 @@ int main(int argc, char **argv) {
                 rh->fields = resp_fields;
                 rh->count  = 1;
 
+                /* build response body with client identity */
+                char body[256];
+                int body_len = snprintf(body, sizeof(body),
+                    "mTLS OK\nclient_cn: %s\nclient_dn: %s\n",
+                    (pc && pc->subject_cn) ? pc->subject_cn : "(anonymous)",
+                    (pc && pc->subject_dn) ? pc->subject_dn : "(none)");
+
                 sh2_resp_body_t *rb = NULL;
                 shift_entity_get_component(sh, e, comp.resp_body, (void **)&rb);
-                rb->data = strdup("mTLS echo OK\n");
-                rb->len  = 13;
+                rb->data = strdup(body);
+                rb->len  = (uint32_t)body_len;
 
                 sh2_status_t *st = NULL;
                 shift_entity_get_component(sh, e, comp.status, (void **)&st);

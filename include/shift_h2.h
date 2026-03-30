@@ -82,6 +82,19 @@ typedef struct {
     uint64_t tag; /* opaque tenant/domain identifier; 0 for h2c */
 } sh2_domain_tag_t;
 
+/* Peer certificate information — extracted from the TLS peer certificate
+ * after handshake.  All string fields are shift-h2-owned and freed by the
+ * component destructor.  When present==false (h2c, or TLS without client
+ * cert), all pointers are NULL. */
+typedef struct {
+    bool     present;                    /* true if peer cert was provided */
+    char    *subject_cn;                 /* Common Name from subject, or NULL */
+    char    *subject_dn;                 /* full subject distinguished name */
+    char    *issuer_dn;                  /* full issuer distinguished name */
+    char    *serial_hex;                 /* serial number as hex string */
+    uint8_t  fingerprint_sha256[32];     /* SHA-256 of DER-encoded cert */
+} sh2_peer_cert_t;
+
 /* Target address + hostname for outgoing HTTP/2 connections */
 typedef struct {
     struct sockaddr_in addr;
@@ -103,6 +116,7 @@ typedef struct {
     shift_component_id_t status;
     shift_component_id_t io_result;
     shift_component_id_t domain_tag;
+    shift_component_id_t peer_cert;
     shift_component_id_t connect_target;
 } sh2_component_ids_t;
 

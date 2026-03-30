@@ -57,7 +57,7 @@ int main(int argc, char **argv) {
     shift_component_id_t all_comps[] = {
         comp.stream_id, comp.session, comp.req_headers, comp.req_body,
         comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
-        comp.domain_tag,
+        comp.domain_tag, comp.peer_cert,
     };
     shift_collection_id_t request_out, response_in, response_result_out;
     {

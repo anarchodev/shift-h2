@@ -57,6 +57,20 @@ static void resp_body_dtor(shift_t *ctx, shift_collection_id_t col_id,
     }
 }
 
+static void peer_cert_dtor(shift_t *ctx, shift_collection_id_t col_id,
+                           const shift_entity_t *entities, void *data,
+                           uint32_t offset, uint32_t count, void *user_data) {
+    (void)ctx; (void)col_id; (void)entities; (void)user_data;
+    sh2_peer_cert_t *pcs = (sh2_peer_cert_t *)data + offset;
+    for (uint32_t i = 0; i < count; i++) {
+        free(pcs[i].subject_cn);
+        free(pcs[i].subject_dn);
+        free(pcs[i].issuer_dn);
+        free(pcs[i].serial_hex);
+        pcs[i] = (sh2_peer_cert_t){0};
+    }
+}
+
 /* --------------------------------------------------------------------------
  * sh2_register_components
  * -------------------------------------------------------------------------- */
@@ -90,6 +104,7 @@ sh2_result_t sh2_register_components(shift_t *sh, sh2_component_ids_t *out) {
     REG(status,       sh2_status_t)
     REG(io_result,    sh2_io_result_t)
     REG(domain_tag,   sh2_domain_tag_t)
+    REG_EX(peer_cert, sh2_peer_cert_t, peer_cert_dtor)
     REG(connect_target, sh2_connect_target_t)
 
 #undef REG
@@ -237,7 +252,7 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             cfg->comp_ids.req_headers, cfg->comp_ids.req_body,
             cfg->comp_ids.resp_headers, cfg->comp_ids.resp_body,
             cfg->comp_ids.status,     cfg->comp_ids.io_result,
-            cfg->comp_ids.domain_tag,
+            cfg->comp_ids.domain_tag, cfg->comp_ids.peer_cert,
         };
         shift_collection_info_t ci = {
             .name       = "response_sending",
@@ -315,7 +330,7 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
                 cfg->comp_ids.req_headers, cfg->comp_ids.req_body,
                 cfg->comp_ids.resp_headers, cfg->comp_ids.resp_body,
                 cfg->comp_ids.status,     cfg->comp_ids.io_result,
-                cfg->comp_ids.domain_tag,
+                cfg->comp_ids.domain_tag, cfg->comp_ids.peer_cert,
             };
             shift_collection_info_t ci = {
                 .name       = "client_request_sending",
