@@ -9,7 +9,7 @@ HTTP/2 requests and responses are modeled as ECS entities with typed components,
 - **Server**: Accept HTTP/2 connections (cleartext h2c or TLS h2), receive requests, send responses
 - **Client**: Initiate outgoing HTTP/2 connections, send requests, receive responses
 - **TLS**: ALPN h2 negotiation, SNI-based certificate selection with per-connection domain tags
-- **Mutual TLS**: Server-side client certificate verification; client-side certificate presentation
+- **Mutual TLS**: Server-side client certificate verification; client-side certificate presentation; peer certificate identity available per-request for path-based authorization
 - **io_uring**: All I/O is async via io_uring provided buffers, including optional `IORING_SETUP_SQPOLL`
 - **Multi-threaded**: Shared-nothing worker model via `SO_REUSEPORT`; each thread gets its own contexts
 
@@ -56,7 +56,7 @@ Same echo behavior over TLS with ALPN h2 negotiation. Includes SNI callback for 
 ./build/examples/h2_mtls_echo server-cert.pem server-key.pem client-ca.pem
 ```
 
-TLS echo server that requires client certificates. Connections without a valid client cert are rejected during the TLS handshake.
+TLS echo server that requires client certificates. Connections without a valid client cert are rejected during the TLS handshake. Demonstrates reading `sh2_peer_cert_t` to log client identity.
 
 ### Client — cleartext h2c
 
@@ -146,7 +146,7 @@ sh2_register_components(sh, &comp);
 shift_component_id_t all[] = {
     comp.stream_id, comp.session, comp.req_headers, comp.req_body,
     comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
-    comp.domain_tag,
+    comp.domain_tag, comp.peer_cert,
 };
 shift_collection_id_t request_out, response_in, response_result_out;
 // ... register each with shift_collection_register() ...
@@ -243,9 +243,12 @@ sh2_cert_id_t cert_id;
 sh2_tls_config_add_cert(tls, cert_pem, key_pem, &cert_id);
 sh2_tls_config_set_sni_callback(tls, my_sni_callback, user_data);
 
-// Server mTLS — require client certificates
+// Server mTLS — require client certificates (reject if missing)
 sh2_tls_config_set_client_verify(tls,
     SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, ca_pem);
+
+// Server mTLS — request client certificates but allow anonymous
+sh2_tls_config_set_client_verify(tls, SSL_VERIFY_PEER, ca_pem);
 
 // Client TLS with mTLS presentation
 sh2_tls_client_config_t *client_tls;
@@ -253,6 +256,40 @@ sh2_tls_client_config_create(&client_tls);
 sh2_tls_client_config_set_cert(client_tls, cert_pem, key_pem);
 sh2_tls_client_config_add_ca(client_tls, ca_pem);
 ```
+
+### Per-request client certificate authorization
+
+When mTLS is enabled (even with `SSL_VERIFY_PEER` alone), each request entity carries an `sh2_peer_cert_t` component with the verified client certificate identity. This allows path-based access control on a single port — some paths require a cert, others don't.
+
+```c
+sh2_peer_cert_t *pc;
+shift_entity_get_component(sh, entity, comp.peer_cert, (void **)&pc);
+
+sh2_req_headers_t *rh;
+shift_entity_get_component(sh, entity, comp.req_headers, (void **)&rh);
+// ... extract :path from rh->fields ...
+
+if (starts_with(path, "/admin/")) {
+    if (!pc->present) {
+        // 403 — client cert required for /admin/*
+    } else if (strcmp(pc->subject_cn, "admin-service") != 0) {
+        // 403 — wrong client identity
+    }
+}
+```
+
+Fields available on `sh2_peer_cert_t`:
+
+| Field | Type | Description |
+|---|---|---|
+| `present` | `bool` | `true` if peer certificate was provided |
+| `subject_cn` | `char *` | Common Name from subject (e.g. `"billing-service"`) |
+| `subject_dn` | `char *` | Full subject distinguished name |
+| `issuer_dn` | `char *` | Full issuer distinguished name |
+| `serial_hex` | `char *` | Certificate serial number as hex |
+| `fingerprint_sha256` | `uint8_t[32]` | SHA-256 fingerprint of DER-encoded cert |
+
+All string fields are `NULL` when `present` is `false` (h2c connections or TLS without client cert). Strings are owned by shift-h2 and freed by the component destructor when the entity is destroyed.
 
 ## Memory ownership
 
@@ -262,6 +299,7 @@ sh2_tls_client_config_add_ca(client_tls, ca_pem);
 | `req_body.data` | shift-h2 | shift-h2 destructor |
 | `resp_headers.fields` | App (`malloc`) | shift-h2 destructor |
 | `resp_body.data` | App (`malloc`) | shift-h2 destructor |
+| `peer_cert` strings | shift-h2 | shift-h2 destructor |
 
 Response header `name`/`value` pointers are **not** freed by the destructor. They may be string literals, stack pointers, or embedded in the fields allocation.
 
