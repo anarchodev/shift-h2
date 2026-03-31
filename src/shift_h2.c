@@ -245,19 +245,24 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         }
     }
 
-    /* internal collection: response_sending */
+    /* internal collection: response_sending
+     * Mirror response_in's component list so user-added components
+     * survive the response_in → response_sending → response_result_out
+     * pipeline without being destructed. */
     {
-        shift_component_id_t comps[] = {
-            cfg->comp_ids.stream_id,  cfg->comp_ids.session,
-            cfg->comp_ids.req_headers, cfg->comp_ids.req_body,
-            cfg->comp_ids.resp_headers, cfg->comp_ids.resp_body,
-            cfg->comp_ids.status,     cfg->comp_ids.io_result,
-            cfg->comp_ids.domain_tag, cfg->comp_ids.peer_cert,
-        };
+        const shift_component_id_t *resp_comps = NULL;
+        uint32_t resp_comp_count = 0;
+        if (shift_collection_get_components(ctx->shift,
+                ctx->coll_ids.response_in,
+                &resp_comps, &resp_comp_count) != shift_ok) {
+            sio_context_destroy(ctx->sio);
+            free(ctx);
+            return sh2_error_invalid;
+        }
         shift_collection_info_t ci = {
             .name       = "response_sending",
-            .comp_ids   = comps,
-            .comp_count = sizeof(comps) / sizeof(comps[0]),
+            .comp_ids   = resp_comps,
+            .comp_count = resp_comp_count,
         };
         if (shift_collection_register(ctx->shift, &ci,
                                       &ctx->coll_response_sending) != shift_ok) {
