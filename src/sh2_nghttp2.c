@@ -285,7 +285,7 @@ static void stream_finish(sh2_context_t *ctx, sh2_stream_t *stream,
     io->error = error_code ? -1 : 0;
 
     SH2_CHECK(shift_entity_move_one(sh, stream->entity,
-                          ctx->coll_ids.response_result_out),
+                          ctx->coll_ids.stream_result_out),
               "move entity to result_out (stream_finish)");
 }
 
@@ -392,7 +392,7 @@ void sh2_nghttp2_session_destroy(sh2_context_t *ctx, uint32_t conn_idx) {
 
     /* Terminate session — this causes nghttp2 to mark all open streams
      * as closed, firing on_stream_close callbacks during the next
-     * mem_send so entities move to response_result_out. */
+     * mem_send so entities move to stream_result_out. */
     nghttp2_session_terminate_session(conn->ng_session, NGHTTP2_NO_ERROR);
 
     /* Drive the session to flush stream close callbacks */

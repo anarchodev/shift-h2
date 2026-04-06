@@ -58,31 +58,17 @@ static void consume_responses(sh2_context_t *ctx) {
     sh2_resp_headers_t *rh = &rhs[i];
     sh2_resp_body_t *rb = &rbs[i];
 
-    /* find connection */
-    if (shift_entity_is_stale(sh, sess->entity)) {
+    /* find connection via conn_idx component on session entity */
+    sh2_conn_idx_t *cidx = NULL;
+    if (shift_entity_is_stale(sh, sess->entity) ||
+        shift_entity_get_component(sh, sess->entity, ctx->internal_conn_idx,
+                                    (void **)&cidx) != shift_ok) {
       ios[i].error = -1;
-      SH2_CHECK(shift_entity_move_one(sh, entity, ctx->coll_ids.response_result_out),
-                "move stale entity to result_out");
+      SH2_CHECK(shift_entity_move_one(sh, entity, ctx->coll_ids.stream_result_out),
+                "move stale/orphan entity to result_out");
       continue;
     }
-
-    /* find conn_idx by matching user_conn_entity */
-    uint32_t conn_idx = UINT32_MAX;
-    for (uint32_t j = 0; j < ctx->max_connections; j++) {
-      if (ctx->conns[j].ng_session &&
-          ctx->conns[j].user_conn_entity.index == sess->entity.index &&
-          ctx->conns[j].user_conn_entity.generation ==
-              sess->entity.generation) {
-        conn_idx = j;
-        break;
-      }
-    }
-    if (conn_idx == UINT32_MAX) {
-      ios[i].error = -1;
-      SH2_CHECK(shift_entity_move_one(sh, entity, ctx->coll_ids.response_result_out),
-                "move orphan entity to result_out");
-      continue;
-    }
+    uint32_t conn_idx = cidx->idx;
 
     sh2_conn_t *conn = &ctx->conns[conn_idx];
 
@@ -152,7 +138,7 @@ static void consume_responses(sh2_context_t *ctx) {
                                             (void **)&io),
                 "get io_result (no-stream)");
       io->error = -1;
-      SH2_CHECK(shift_entity_move_one(sh, entity, ctx->coll_ids.response_result_out),
+      SH2_CHECK(shift_entity_move_one(sh, entity, ctx->coll_ids.stream_result_out),
                 "move no-stream entity to result_out");
     }
   }
@@ -1345,12 +1331,15 @@ static void consume_client_requests(sh2_context_t *ctx) {
   if (count == 0) return;
 
   sh2_session_t *sessions = NULL;
+  sh2_stream_id_t *sids = NULL;
   sh2_req_headers_t *rhs = NULL;
   sh2_req_body_t *rbs = NULL;
   sh2_io_result_t *ios = NULL;
 
   shift_collection_get_component_array(sh, coll, ctx->comp_ids.session,
                                        (void **)&sessions, NULL);
+  shift_collection_get_component_array(sh, coll, ctx->comp_ids.stream_id,
+                                       (void **)&sids, NULL);
   shift_collection_get_component_array(sh, coll, ctx->comp_ids.req_headers,
                                        (void **)&rhs, NULL);
   shift_collection_get_component_array(sh, coll, ctx->comp_ids.req_body,
@@ -1364,32 +1353,18 @@ static void consume_client_requests(sh2_context_t *ctx) {
     sh2_req_headers_t *rh = &rhs[i];
     sh2_req_body_t *rb = &rbs[i];
 
-    /* find connection */
-    if (shift_entity_is_stale(sh, sess->entity)) {
+    /* find connection via conn_idx component on session entity */
+    sh2_conn_idx_t *cidx = NULL;
+    if (shift_entity_is_stale(sh, sess->entity) ||
+        shift_entity_get_component(sh, sess->entity, ctx->internal_conn_idx,
+                                    (void **)&cidx) != shift_ok) {
       ios[i].error = -1;
       SH2_CHECK(shift_entity_move_one(sh, entity,
-                    ctx->coll_ids_client.response_result_out),
-                "move stale client request to result_out");
+                    ctx->coll_ids_client.stream_result_out),
+                "move stale/orphan client request to result_out");
       continue;
     }
-
-    uint32_t conn_idx = UINT32_MAX;
-    for (uint32_t j = 0; j < ctx->max_connections; j++) {
-      if (ctx->conns[j].ng_session &&
-          ctx->conns[j].user_conn_entity.index == sess->entity.index &&
-          ctx->conns[j].user_conn_entity.generation ==
-              sess->entity.generation) {
-        conn_idx = j;
-        break;
-      }
-    }
-    if (conn_idx == UINT32_MAX) {
-      ios[i].error = -1;
-      SH2_CHECK(shift_entity_move_one(sh, entity,
-                    ctx->coll_ids_client.response_result_out),
-                "move orphan client request to result_out");
-      continue;
-    }
+    uint32_t conn_idx = cidx->idx;
 
     sh2_conn_t *conn = &ctx->conns[conn_idx];
 
@@ -1433,23 +1408,117 @@ static void consume_client_requests(sh2_context_t *ctx) {
       ios[i].error = -1;
       if (data_prd.source.ptr) free(data_prd.source.ptr);
       SH2_CHECK(shift_entity_move_one(sh, entity,
-                    ctx->coll_ids_client.response_result_out),
+                    ctx->coll_ids_client.stream_result_out),
                 "move failed client request to result_out");
       continue;
     }
+
+    /* record stream_id on the entity */
+    sids[i].id = (uint32_t)stream_id;
 
     /* move to internal sending collection */
     SH2_CHECK(shift_entity_move_one(sh, entity, ctx->coll_client_request_sending),
               "move client request to sending");
 
-    /* associate entity with the stream */
-    sh2_stream_t *stream =
-        nghttp2_session_get_stream_user_data(conn->ng_session, stream_id);
+    /* allocate stream and associate entity + nghttp2 stream user data */
+    sh2_stream_t *stream = sh2_stream_alloc(conn_idx);
     if (stream) {
       stream->entity        = entity;
-      stream->emitted       = false;
       stream->send_complete = !data_prd.read_callback;
+      nghttp2_session_set_stream_user_data(conn->ng_session, stream_id, stream);
     }
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Client: consume connect_close_in — send GOAWAY for graceful shutdown
+ * -------------------------------------------------------------------------- */
+
+static void consume_client_connect_closes(sh2_context_t *ctx) {
+  if (!ctx->enable_connect) return;
+
+  shift_t *sh = ctx->shift;
+  shift_collection_id_t coll = ctx->coll_ids_client.connect_close_in;
+  shift_entity_t *entities = NULL;
+  size_t count = 0;
+
+  shift_collection_get_entities(sh, coll, &entities, &count);
+  if (count == 0) return;
+
+  sh2_session_t *sessions = NULL;
+  shift_collection_get_component_array(sh, coll, ctx->comp_ids.session,
+                                       (void **)&sessions, NULL);
+
+  for (size_t i = 0; i < count; i++) {
+    shift_entity_t entity = entities[i];
+    sh2_session_t *sess = &sessions[i];
+
+    /* find connection via conn_idx component on session entity */
+    sh2_conn_idx_t *cidx = NULL;
+    if (!shift_entity_is_stale(sh, sess->entity))
+      shift_entity_get_component(sh, sess->entity, ctx->internal_conn_idx,
+                                  (void **)&cidx);
+
+    if (cidx) {
+      sh2_conn_t *conn = &ctx->conns[cidx->idx];
+      int32_t last_stream_id =
+          nghttp2_session_get_last_proc_stream_id(conn->ng_session);
+      nghttp2_submit_goaway(conn->ng_session, NGHTTP2_FLAG_NONE,
+                            last_stream_id, NGHTTP2_NO_ERROR, NULL, 0);
+    }
+
+    shift_entity_destroy_one(sh, entity);
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Client: consume cancel_in — send RST_STREAM for cancelled requests
+ * -------------------------------------------------------------------------- */
+
+static void consume_client_cancels(sh2_context_t *ctx) {
+  if (!ctx->enable_connect) return;
+
+  shift_t *sh = ctx->shift;
+  shift_collection_id_t coll = ctx->coll_ids_client.cancel_in;
+  shift_entity_t *entities = NULL;
+  size_t count = 0;
+
+  shift_collection_get_entities(sh, coll, &entities, &count);
+  if (count == 0) return;
+
+  sh2_stream_id_t *sids = NULL;
+  sh2_session_t *sessions = NULL;
+  sh2_io_result_t *ios = NULL;
+
+  shift_collection_get_component_array(sh, coll, ctx->comp_ids.stream_id,
+                                       (void **)&sids, NULL);
+  shift_collection_get_component_array(sh, coll, ctx->comp_ids.session,
+                                       (void **)&sessions, NULL);
+  shift_collection_get_component_array(sh, coll, ctx->comp_ids.io_result,
+                                       (void **)&ios, NULL);
+
+  for (size_t i = 0; i < count; i++) {
+    shift_entity_t entity = entities[i];
+    sh2_session_t *sess = &sessions[i];
+    uint32_t sid = sids[i].id;
+
+    /* find connection via conn_idx component on session entity */
+    sh2_conn_idx_t *cidx = NULL;
+    if (!shift_entity_is_stale(sh, sess->entity))
+      shift_entity_get_component(sh, sess->entity, ctx->internal_conn_idx,
+                                  (void **)&cidx);
+
+    /* submit RST_STREAM if connection is alive */
+    if (cidx && sid != 0) {
+      nghttp2_submit_rst_stream(ctx->conns[cidx->idx].ng_session,
+                                NGHTTP2_FLAG_NONE, (int32_t)sid,
+                                NGHTTP2_CANCEL);
+    }
+
+    ios[i].error = -1;
+    SH2_CHECK(shift_entity_move_one(sh, entity,
+                  ctx->coll_ids_client.stream_result_out),
+              "move cancelled request to result_out");
   }
 }
 
@@ -1472,9 +1541,11 @@ sh2_result_t sh2_poll(sh2_context_t *ctx, uint32_t min_complete) {
 
   /* server: consume responses queued by user */
   consume_responses(ctx);
-  /* client: consume connect requests and client requests */
+  /* client: consume connect requests, client requests, cancels, closes */
   consume_connect_requests(ctx);
   consume_client_requests(ctx);
+  consume_client_cancels(ctx);
+  consume_client_connect_closes(ctx);
   SH2_CHECK(shift_flush(ctx->shift), "shift_flush");
 
   /* client: process sio connect results */
@@ -1521,6 +1592,7 @@ sh2_result_t sh2_poll(sh2_context_t *ctx, uint32_t min_complete) {
   /* second pass for responses/requests queued during this tick */
   consume_responses(ctx);
   consume_client_requests(ctx);
+  consume_client_cancels(ctx);
   SH2_CHECK(shift_flush(ctx->shift), "shift_flush");
 
   /* drive all nghttp2 output (direction-agnostic) */

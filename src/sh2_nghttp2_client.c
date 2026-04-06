@@ -15,31 +15,14 @@
   } while (0)
 
 /* --------------------------------------------------------------------------
- * Emit a completed response into client_colls.response_out
+ * Populate response components on the existing request entity.
+ * The entity stays in coll_client_request_sending — the single move to
+ * stream_result_out happens in stream_finish_client when the stream closes.
  * -------------------------------------------------------------------------- */
 
-static void stream_emit_response(sh2_context_t *ctx, sh2_stream_t *stream,
-                                 int32_t stream_id) {
+static void stream_emit_response(sh2_context_t *ctx, sh2_stream_t *stream) {
     shift_t *sh = ctx->shift;
-
-    shift_entity_t entity;
-    SH2_CHECK(shift_entity_create_one_begin(sh, ctx->coll_ids_client.response_out,
-                                             &entity),
-              "create client response entity");
-
-    /* stream_id */
-    sh2_stream_id_t *sid = NULL;
-    SH2_CHECK(shift_entity_get_component(sh, entity, ctx->comp_ids.stream_id,
-                                          (void **)&sid),
-              "get stream_id (client response)");
-    sid->id = (uint32_t)stream_id;
-
-    /* session */
-    sh2_session_t *sess = NULL;
-    SH2_CHECK(shift_entity_get_component(sh, entity, ctx->comp_ids.session,
-                                          (void **)&sess),
-              "get session (client response)");
-    sess->entity = ctx->conns[stream->conn_idx].user_conn_entity;
+    shift_entity_t entity = stream->entity;
 
     /* resp_headers — finalize and transfer ownership */
     uint32_t hdr_count = 0;
@@ -69,19 +52,6 @@ static void stream_emit_response(sh2_context_t *ctx, sh2_stream_t *stream,
                                           (void **)&st),
               "get status (client response)");
     st->code = stream->response_status;
-
-    /* domain_tag — always 0 for client connections */
-    sh2_domain_tag_t *dt = NULL;
-    SH2_CHECK(shift_entity_get_component(sh, entity, ctx->comp_ids.domain_tag,
-                                          (void **)&dt),
-              "get domain_tag (client response)");
-    dt->tag = 0;
-
-    SH2_CHECK(shift_entity_create_end(sh, &entity, 1),
-              "create_end client response entity");
-
-    stream->entity  = entity;
-    stream->emitted = true;
 }
 
 /* --------------------------------------------------------------------------
@@ -95,8 +65,15 @@ static int on_begin_headers_client(nghttp2_session *session,
         frame->headers.cat != NGHTTP2_HCAT_RESPONSE)
         return 0;
 
+    /* stream was already allocated at request submission time */
+    sh2_stream_t *stream = nghttp2_session_get_stream_user_data(
+        session, frame->hd.stream_id);
+    if (stream)
+        return 0;
+
+    /* fallback: allocate for streams we didn't initiate (e.g. server push) */
     sh2_ng_ctx_t *nctx = user_data;
-    sh2_stream_t *stream = sh2_stream_alloc(nctx->conn_idx);
+    stream = sh2_stream_alloc(nctx->conn_idx);
     if (!stream)
         return NGHTTP2_ERR_CALLBACK_FAILURE;
 
@@ -155,9 +132,9 @@ static int on_frame_recv_client(nghttp2_session *session,
 
     sh2_stream_t *stream = nghttp2_session_get_stream_user_data(
         session, frame->hd.stream_id);
-    if (!stream || stream->emitted) return 0;
+    if (!stream) return 0;
 
-    stream_emit_response(nctx->ctx, stream, frame->hd.stream_id);
+    stream_emit_response(nctx->ctx, stream);
     return 0;
 }
 
@@ -172,7 +149,7 @@ static void stream_finish_client(sh2_context_t *ctx, sh2_stream_t *stream,
     io->error = error_code ? -1 : 0;
 
     SH2_CHECK(shift_entity_move_one(sh, stream->entity,
-                          ctx->coll_ids_client.response_result_out),
+                          ctx->coll_ids_client.stream_result_out),
               "move entity to client result_out");
 }
 
@@ -183,8 +160,7 @@ static int on_stream_close_client(nghttp2_session *session, int32_t stream_id,
         session, stream_id);
     if (!stream) return 0;
 
-    if (stream->emitted)
-        stream_finish_client(nctx->ctx, stream, error_code);
+    stream_finish_client(nctx->ctx, stream, error_code);
 
     nghttp2_session_set_stream_user_data(session, stream_id, NULL);
     sh2_stream_free(stream);

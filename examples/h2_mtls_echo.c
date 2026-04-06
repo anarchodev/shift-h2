@@ -101,17 +101,17 @@ int main(int argc, char **argv) {
         comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
         comp.domain_tag, comp.peer_cert,
     };
-    shift_collection_id_t request_out, response_in, response_result_out;
+    shift_collection_id_t request_out, response_in, stream_result_out;
     {
         shift_collection_info_t ci  = { .name = "request_out",         .comp_ids = all_comps,
                                         .comp_count = sizeof(all_comps)/sizeof(all_comps[0]) };
         shift_collection_info_t ci2 = { .name = "response_in",         .comp_ids = all_comps,
                                         .comp_count = sizeof(all_comps)/sizeof(all_comps[0]) };
-        shift_collection_info_t ci3 = { .name = "response_result_out", .comp_ids = all_comps,
+        shift_collection_info_t ci3 = { .name = "stream_result_out", .comp_ids = all_comps,
                                         .comp_count = sizeof(all_comps)/sizeof(all_comps[0]) };
         shift_collection_register(sh, &ci, &request_out);
         shift_collection_register(sh, &ci2, &response_in);
-        shift_collection_register(sh, &ci3, &response_result_out);
+        shift_collection_register(sh, &ci3, &stream_result_out);
     }
 
     sh2_context_t *ctx = NULL;
@@ -124,7 +124,7 @@ int main(int argc, char **argv) {
         .buf_size            = BUF_SIZE,
         .request_out         = request_out,
         .response_in         = response_in,
-        .response_result_out = response_result_out,
+        .stream_result_out = stream_result_out,
         .tls                 = tls,
     };
     sh2_result_t r = sh2_context_create(&cfg, &ctx);
@@ -198,7 +198,7 @@ int main(int argc, char **argv) {
         {
             shift_entity_t *entities = NULL;
             size_t count = 0;
-            shift_collection_get_entities(sh, response_result_out, &entities, &count);
+            shift_collection_get_entities(sh, stream_result_out, &entities, &count);
             for (size_t i = 0; i < count; i++)
                 shift_entity_destroy_one(sh, entities[i]);
         }

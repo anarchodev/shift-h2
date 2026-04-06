@@ -88,7 +88,7 @@ shift-io accept → nghttp2 decode → request entity → request_out
                                                          │
                                         app processes request, builds response
                                                          │
-response_result_out ← response_sending ← response_in ←──┘
+stream_result_out ← response_sending ← response_in ←──┘
         │
    app destroys entity
 ```
@@ -104,7 +104,7 @@ connect_result_out (session entity) ←─────────────�
         │
 request_in → nghttp2 submit_request → response entity → response_out
                                                               │
-                                              response_result_out (stream close)
+                                              stream_result_out (stream close)
                                                               │
                                                     app destroys entity
 ```
@@ -148,7 +148,7 @@ shift_component_id_t all[] = {
     comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
     comp.domain_tag, comp.peer_cert,
 };
-shift_collection_id_t request_out, response_in, response_result_out;
+shift_collection_id_t request_out, response_in, stream_result_out;
 // ... register each with shift_collection_register() ...
 
 // 4. Create sh2 context
@@ -162,7 +162,7 @@ sh2_context_create(&(sh2_config_t){
     .buf_size        = 65536,
     .request_out         = request_out,
     .response_in         = response_in,
-    .response_result_out = response_result_out,
+    .stream_result_out = stream_result_out,
 }, &ctx);
 
 // 5. Listen (server) or connect (client)
@@ -203,7 +203,7 @@ while (running) {
     }
 
     // Drain completed responses
-    shift_collection_get_entities(sh, response_result_out, &entities, &count);
+    shift_collection_get_entities(sh, stream_result_out, &entities, &count);
     for (size_t i = 0; i < count; i++)
         shift_entity_destroy_one(sh, entities[i]);
 

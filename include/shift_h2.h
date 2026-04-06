@@ -134,11 +134,11 @@ typedef struct {
      *   sending collection until the stream closes. */
     shift_collection_id_t response_in;
 
-    /* response_result_out: stream fully closed (io_result.error == 0) or
+    /* stream_result_out: stream fully closed (io_result.error == 0) or
      *   failed (io_result.error < 0).
      *   Required components: same as response_in.
      *   App frees resp_headers/resp_body memory and destroys entity. */
-    shift_collection_id_t response_result_out;
+    shift_collection_id_t stream_result_out;
 } sh2_collection_ids_t;
 
 /* Client (outgoing) collection IDs — only valid when enable_connect is true. */
@@ -151,18 +151,30 @@ typedef struct {
      *   failed (io_result.error < 0).  On success, session.entity is set. */
     shift_collection_id_t connect_result_out;
 
+    /* connect_close_in: app moves an entity here to gracefully close a
+     *   connection.  Required components: {session}.
+     *   sh2 sends GOAWAY and lets in-flight streams drain.  The entity is
+     *   destroyed after the GOAWAY is submitted. */
+    shift_collection_id_t connect_close_in;
+
     /* request_in: app deposits request-ready entities here.
      *   Required components: {session, req_headers, req_body}.
      *   req_headers must include :method, :path, :scheme, :authority. */
     shift_collection_id_t request_in;
 
+    /* cancel_in: app moves in-flight request entities here to cancel.
+     *   Required components: {stream_id, session}.
+     *   sh2 sends RST_STREAM and moves the entity to stream_result_out
+     *   with io_result.error = -1. */
+    shift_collection_id_t cancel_in;
+
     /* response_out: completed response entities delivered here.
      *   Components: {stream_id, session, resp_headers, resp_body, status}. */
     shift_collection_id_t response_out;
 
-    /* response_result_out: stream fully closed — app destroys entity.
+    /* stream_result_out: stream fully closed — app destroys entity.
      *   Components: same as response_out + io_result. */
-    shift_collection_id_t response_result_out;
+    shift_collection_id_t stream_result_out;
 } sh2_client_collection_ids_t;
 
 /* --------------------------------------------------------------------------
@@ -251,7 +263,7 @@ typedef struct {
      * and preserved across entity moves. */
     shift_collection_id_t request_out;
     shift_collection_id_t response_in;
-    shift_collection_id_t response_result_out;
+    shift_collection_id_t stream_result_out;
 #ifdef SH2_HAS_TLS
     /* TLS configuration — NULL = cleartext h2c.  Non-NULL enables TLS
      * with ALPN h2 negotiation and SNI-based certificate selection. */

@@ -128,7 +128,7 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
 
     ctx->coll_ids.request_out         = cfg->request_out;
     ctx->coll_ids.response_in         = cfg->response_in;
-    ctx->coll_ids.response_result_out = cfg->response_result_out;
+    ctx->coll_ids.stream_result_out = cfg->stream_result_out;
 
     /* register sio components */
     if (sio_register_components(ctx->shift, &ctx->sio_comp_ids) != sio_ok) {
@@ -247,7 +247,7 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
 
     /* internal collection: response_sending
      * Mirror response_in's component list so user-added components
-     * survive the response_in → response_sending → response_result_out
+     * survive the response_in → response_sending → stream_result_out
      * pipeline without being destructed. */
     {
         const shift_component_id_t *resp_comps = NULL;
