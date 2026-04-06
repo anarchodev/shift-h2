@@ -827,6 +827,7 @@ static void process_connect_results(sh2_context_t *ctx) {
   if (!ctx->enable_connect) return;
 
   shift_t *sh = ctx->shift;
+  const sio_collection_ids_t *sio_colls = sio_get_collection_ids(ctx->sio);
 
   shift_entity_t *entities = NULL;
   size_t count = 0;
@@ -835,7 +836,7 @@ static void process_connect_results(sh2_context_t *ctx) {
   if (count == 0) return;
 
   sio_io_result_t *results = NULL;
-  sio_conn_entity_t *conns = NULL;
+  sio_conn_entity_t *sio_conns = NULL;
   sio_user_conn_entity_t *uconns = NULL;
 
   shift_collection_get_component_array(sh, ctx->sio_connect_results,
@@ -843,7 +844,7 @@ static void process_connect_results(sh2_context_t *ctx) {
                                        (void **)&results, NULL);
   shift_collection_get_component_array(sh, ctx->sio_connect_results,
                                        ctx->sio_comp_ids.conn_entity,
-                                       (void **)&conns, NULL);
+                                       (void **)&sio_conns, NULL);
   shift_collection_get_component_array(sh, ctx->sio_connect_results,
                                        ctx->sio_comp_ids.user_conn_entity,
                                        (void **)&uconns, NULL);
@@ -857,15 +858,134 @@ static void process_connect_results(sh2_context_t *ctx) {
       continue;
     }
 
-    /* success: set up the conn_idx on the user_conn entity */
-    shift_entity_t user_conn = uconns[i].entity;
+    /* success — initialize the client connection immediately so that the
+     * h2 connection preface is sent this tick.  Waiting for a read to arrive
+     * (as reads_init_client_connections does) deadlocks: the server won't
+     * send until it receives the client preface. */
+
+    shift_entity_t user_conn  = uconns[i].entity;
+    shift_entity_t conn_ent   = sio_conns[i].entity;
 
     sh2_conn_idx_t *cidx = NULL;
     SH2_CHECK(shift_entity_get_component(sh, user_conn, ctx->internal_conn_idx,
                                           (void **)&cidx),
               "get conn_idx (connect result)");
-    cidx->state     = SH2_CONN_NEW;
+
+    /* find the conn slot that consume_connect_requests reserved (has hostname
+     * but no ng_session) */
+    uint32_t conn_idx = UINT32_MAX;
+    for (uint32_t j = 0; j < ctx->max_connections; j++) {
+      if (!ctx->conns[j].ng_session && !ctx->conns[j].draining
+          && ctx->conns[j].hostname) {
+        conn_idx = j;
+        break;
+      }
+    }
+    if (conn_idx == UINT32_MAX) {
+      SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                "destroy connect result (no slot)");
+      continue;
+    }
+
+    cidx->idx       = conn_idx;
     cidx->direction = SH2_DIR_CLIENT;
+
+    sh2_conn_t *conn = &ctx->conns[conn_idx];
+    char *hostname = conn->hostname;
+    *conn = (sh2_conn_t){
+        .conn_entity      = conn_ent,
+        .user_conn_entity = user_conn,
+        .last_active_poll = ctx->poll_count,
+        .hostname         = hostname,
+    };
+
+#ifdef SH2_HAS_TLS
+    if (ctx->tls_client_config) {
+      if (sh2_tls_client_conn_create(ctx, conn_idx, hostname) != sh2_ok) {
+        free(conn->hostname);
+        *conn = (sh2_conn_t){0};
+        SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                  "destroy connect result (tls fail)");
+        continue;
+      }
+      cidx->state = SH2_CONN_TLS_HANDSHAKE;
+
+      /* drive initial ClientHello */
+      uint32_t wbio_len = 0;
+      uint8_t *wbio_data = sh2_tls_drain_wbio(ctx, conn_idx, &wbio_len);
+
+      uint8_t dummy[1];
+      uint32_t dummy_len = 0;
+      sh2_tls_feed(ctx, conn_idx, NULL, 0, dummy, 0, &dummy_len);
+
+      if (!wbio_data)
+        wbio_data = sh2_tls_drain_wbio(ctx, conn_idx, &wbio_len);
+
+      if (wbio_data && wbio_len > 0) {
+        shift_entity_t we;
+        SH2_CHECK(shift_entity_create_one_begin(sh, sio_colls->write_in, &we),
+                  "create write entity (client hello)");
+
+        sio_write_buf_t *wb = NULL;
+        SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.write_buf,
+                                              (void **)&wb),
+                  "get write_buf (client hello)");
+        wb->data   = wbio_data;
+        wb->len    = wbio_len;
+        wb->offset = 0;
+
+        sio_conn_entity_t *ce = NULL;
+        SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.conn_entity,
+                                              (void **)&ce),
+                  "get conn_entity (client hello)");
+        ce->entity = conn->conn_entity;
+
+        sio_user_conn_entity_t *uce = NULL;
+        SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.user_conn_entity,
+                                              (void **)&uce),
+                  "get user_conn_entity (client hello)");
+        uce->entity = conn->user_conn_entity;
+
+        SH2_CHECK(shift_entity_create_one_end(sh, we),
+                  "create_end write entity (client hello)");
+        conn->pending_writes++;
+      }
+    } else
+#endif
+    {
+      cidx->state = SH2_CONN_ACTIVE;
+
+      if (sh2_nghttp2_client_session_create(ctx, conn_idx) != sh2_ok) {
+        free(conn->hostname);
+        *conn = (sh2_conn_t){0};
+        SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
+                  "destroy connect result (session fail)");
+        continue;
+      }
+
+      /* emit connect_result_out — session is ready */
+      {
+        shift_entity_t re;
+        SH2_CHECK(shift_entity_create_one_begin(sh,
+                      ctx->coll_ids_client.connect_result_out, &re),
+                  "create connect_result entity (h2c)");
+
+        sh2_session_t *sess = NULL;
+        SH2_CHECK(shift_entity_get_component(sh, re, ctx->comp_ids.session,
+                                              (void **)&sess),
+                  "get session (connect_result h2c)");
+        sess->entity = conn->user_conn_entity;
+
+        sh2_io_result_t *io = NULL;
+        SH2_CHECK(shift_entity_get_component(sh, re, ctx->comp_ids.io_result,
+                                              (void **)&io),
+                  "get io_result (connect_result h2c)");
+        io->error = 0;
+
+        SH2_CHECK(shift_entity_create_end(sh, &re, 1),
+                  "create_end connect_result entity (h2c)");
+      }
+    }
 
     SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
               "destroy connect result entity");
