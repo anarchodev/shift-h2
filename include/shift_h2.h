@@ -286,9 +286,3 @@ sh2_result_t sh2_poll(sh2_context_t *ctx, uint32_t min_complete);
 const sh2_component_ids_t         *sh2_get_component_ids(const sh2_context_t *ctx);
 const sh2_collection_ids_t        *sh2_get_collection_ids(const sh2_context_t *ctx);
 const sh2_client_collection_ids_t *sh2_get_client_collection_ids(const sh2_context_t *ctx);
-
-/* Initiate an outgoing HTTP/2 connection.  Requires enable_connect.
- * The connection result will appear in client_colls.connect_result_out. */
-sh2_result_t sh2_connect(sh2_context_t *ctx,
-                          const struct sockaddr_in *addr,
-                          const char *hostname, uint32_t hostname_len);

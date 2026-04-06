@@ -508,24 +508,3 @@ const sh2_collection_ids_t *sh2_get_collection_ids(const sh2_context_t *ctx) {
 const sh2_client_collection_ids_t *sh2_get_client_collection_ids(const sh2_context_t *ctx) {
     return (ctx && ctx->enable_connect) ? &ctx->coll_ids_client : NULL;
 }
-
-sh2_result_t sh2_connect(sh2_context_t *ctx,
-                          const struct sockaddr_in *addr,
-                          const char *hostname, uint32_t hostname_len) {
-    if (!ctx || !addr) return sh2_error_null;
-    if (!ctx->enable_connect) return sh2_error_invalid;
-
-    shift_t *sh = ctx->shift;
-    const sio_collection_ids_t *sio_colls = sio_get_collection_ids(ctx->sio);
-
-    shift_entity_t ce;
-    shift_result_t sr = shift_entity_create_one_begin(sh, sio_colls->connect_in, &ce);
-    if (sr != shift_ok) return sh2_error_io;
-
-    sio_connect_addr_t *ca = NULL;
-    shift_entity_get_component(sh, ce, ctx->sio_comp_ids.connect_addr, (void **)&ca);
-    ca->addr = *addr;
-
-    shift_entity_create_one_end(sh, ce);
-    return sh2_ok;
-}
