@@ -7,7 +7,7 @@ HTTP/2 requests and responses are modeled as ECS entities with typed components,
 ## Features
 
 - **Server**: Accept HTTP/2 connections (cleartext h2c or TLS h2), receive requests, send responses
-- **Client**: Initiate outgoing HTTP/2 connections, send requests, receive responses
+- **Client**: Initiate outgoing HTTP/2 connections, send requests, receive responses, cancel in-flight streams, graceful connection close
 - **TLS**: ALPN h2 negotiation, SNI-based certificate selection with per-connection domain tags
 - **Mutual TLS**: Server-side client certificate verification; client-side certificate presentation; peer certificate identity available per-request for path-based authorization
 - **io_uring**: All I/O is async via io_uring provided buffers, including optional `IORING_SETUP_SQPOLL`
@@ -103,10 +103,12 @@ connect_result_out (session entity) ←─────────────�
    app creates request with session
         │
 request_in → nghttp2 submit_request → response entity → response_out
-                                                              │
-                                              stream_result_out (stream close)
-                                                              │
-                                                    app destroys entity
+        │                                                     │
+   cancel_in ─→ RST_STREAM ──┐               stream_result_out (stream close)
+                              │                               │
+                              └───────────────────────────→ app destroys entity
+
+connect_close_in ─→ GOAWAY ─→ drain in-flight streams ─→ connection closed
 ```
 
 ### Connection lifecycle
@@ -165,8 +167,24 @@ sh2_context_create(&(sh2_config_t){
     .stream_result_out = stream_result_out,
 }, &ctx);
 
-// 5. Listen (server) or connect (client)
+// 5. Listen (server)
 sh2_listen(ctx, 9000, 4096);
+
+// — or enable client support —
+// Register additional client collections, then:
+sh2_context_create(&(sh2_config_t){
+    // ... server fields as above ...
+    .enable_connect = true,
+    .client_colls = {
+        .connect_out        = connect_out,
+        .connect_result_out = connect_result_out,
+        .connect_close_in   = connect_close_in,
+        .request_in         = client_request_in,
+        .cancel_in          = client_cancel_in,
+        .response_out       = client_response_out,
+        .stream_result_out  = client_result_out,
+    },
+}, &ctx);
 ```
 
 ### Server event loop
@@ -232,6 +250,30 @@ shift_entity_create_one_end(sh, ce);
 // then create request entity in request_in with:
 //   session (from connect result), req_headers (with pseudo-headers), req_body
 ```
+
+### Client cancellation and connection close
+
+```c
+// Cancel an in-flight request — sh2 sends RST_STREAM.
+// Entity appears in stream_result_out with io_result.error = -1.
+shift_entity_move_one(sh, request_entity, cancel_in);
+
+// Graceful connection close — sh2 sends GOAWAY, drains in-flight
+// streams, then destroys the entity.
+shift_entity_move_one(sh, session_entity, connect_close_in);
+```
+
+Client collections:
+
+| Collection | Direction | Purpose |
+|---|---|---|
+| `connect_out` | → sh2 | Initiate outgoing connection |
+| `connect_result_out` | sh2 → | Connection established or failed |
+| `connect_close_in` | → sh2 | Graceful close (GOAWAY + drain) |
+| `request_in` | → sh2 | Submit request on a session |
+| `cancel_in` | → sh2 | Cancel in-flight stream (RST_STREAM) |
+| `response_out` | sh2 → | Completed response headers + body |
+| `stream_result_out` | sh2 → | Stream fully closed — app destroys entity |
 
 ### TLS configuration
 
