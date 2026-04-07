@@ -78,7 +78,7 @@ static void *worker_fn(void *arg) {
     shift_config_t sh_cfg = {
         .max_entities            = MAX_CONNECTIONS * 16 + MAX_STREAMS + 1024,
         .max_components          = 32,
-        .max_collections         = 32,
+        .max_collections         = 64,
         .deferred_queue_capacity = MAX_CONNECTIONS * 256,
         .allocator               = {0},
     };
@@ -102,7 +102,7 @@ static void *worker_fn(void *arg) {
         comp.domain_tag, comp.peer_cert,
     };
     shift_collection_id_t request_out;
-    shift_collection_id_t response_in, stream_result_out;
+    shift_collection_id_t response_in, response_out;
     {
         shift_collection_info_t ci = {
             .name       = "request_out",
@@ -115,13 +115,13 @@ static void *worker_fn(void *arg) {
             .comp_count = sizeof(all_comps) / sizeof(all_comps[0]),
         };
         shift_collection_info_t ci3 = {
-            .name       = "stream_result_out",
+            .name       = "response_out",
             .comp_ids   = all_comps,
             .comp_count = sizeof(all_comps) / sizeof(all_comps[0]),
         };
         if (shift_collection_register(sh, &ci, &request_out) != shift_ok ||
             shift_collection_register(sh, &ci2, &response_in) != shift_ok ||
-            shift_collection_register(sh, &ci3, &stream_result_out) != shift_ok) {
+            shift_collection_register(sh, &ci3, &response_out) != shift_ok) {
             fprintf(stderr, "Worker %d: failed to register collections\n", wcfg->worker_id);
             shift_context_destroy(sh);
             return NULL;
@@ -139,7 +139,7 @@ static void *worker_fn(void *arg) {
         .buf_size            = BUF_SIZE,
         .request_out         = request_out,
         .response_in         = response_in,
-        .stream_result_out = stream_result_out,
+        .response_out    = response_out,
     };
     sh2_result_t r = sh2_context_create(&cfg, &ctx);
     if (r != sh2_ok) {
@@ -218,11 +218,11 @@ static void *worker_fn(void *arg) {
             }
         }
 
-        /* ---- Drain stream_result_out ---- */
+        /* ---- Drain response_out ---- */
         {
             shift_entity_t *entities = NULL;
             size_t          count    = 0;
-            shift_collection_get_entities(sh, stream_result_out,
+            shift_collection_get_entities(sh, response_out,
                                           &entities, &count);
 
             for (size_t i = 0; i < count; i++) {
@@ -247,7 +247,7 @@ static void *worker_fn(void *arg) {
     shift_flush(sh);
 
     shift_collection_id_t drain_cols[] = {
-        request_out, response_in, stream_result_out,
+        request_out, response_in, response_out,
     };
     for (int c = 0; c < 3; c++) {
         shift_entity_t *entities = NULL;

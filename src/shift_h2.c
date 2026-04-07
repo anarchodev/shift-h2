@@ -71,6 +71,45 @@ static void peer_cert_dtor(shift_t *ctx, shift_collection_id_t col_id,
     }
 }
 
+/* Connection component destructor — safety net for cleanup.
+ * In the normal path, ng_session is already NULL (session_destroy was called
+ * during draining).  This catches orphaned entities. */
+static void conn_dtor(shift_t *ctx, shift_collection_id_t col_id,
+                      const shift_entity_t *entities, void *data,
+                      uint32_t offset, uint32_t count, void *user_data) {
+    (void)ctx; (void)col_id; (void)entities; (void)user_data;
+    sh2_conn_t *conns = (sh2_conn_t *)data + offset;
+    for (uint32_t i = 0; i < count; i++) {
+        if (conns[i].ng_session) {
+            nghttp2_session_del(conns[i].ng_session);
+            conns[i].ng_session = NULL;
+        }
+        free(conns[i].ng_ctx);
+        conns[i].ng_ctx = NULL;
+        free(conns[i].hostname);
+        conns[i].hostname = NULL;
+#ifdef SH2_HAS_TLS
+        if (conns[i].tls) {
+            SSL_free(conns[i].tls->ssl);
+            free(conns[i].tls);
+            conns[i].tls = NULL;
+        }
+#endif
+    }
+}
+
+/* Hostname component destructor */
+static void hostname_dtor(shift_t *ctx, shift_collection_id_t col_id,
+                          const shift_entity_t *entities, void *data,
+                          uint32_t offset, uint32_t count, void *user_data) {
+    (void)ctx; (void)col_id; (void)entities; (void)user_data;
+    sh2_hostname_t *hs = (sh2_hostname_t *)data + offset;
+    for (uint32_t i = 0; i < count; i++) {
+        free(hs[i].hostname);
+        hs[i].hostname = NULL;
+    }
+}
+
 /* --------------------------------------------------------------------------
  * sh2_register_components
  * -------------------------------------------------------------------------- */
@@ -128,7 +167,7 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
 
     ctx->coll_ids.request_out         = cfg->request_out;
     ctx->coll_ids.response_in         = cfg->response_in;
-    ctx->coll_ids.stream_result_out = cfg->stream_result_out;
+    ctx->coll_ids.response_out = cfg->response_out;
 
     /* register sio components */
     if (sio_register_components(ctx->shift, &ctx->sio_comp_ids) != sio_ok) {
@@ -136,21 +175,39 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         return sh2_error_invalid;
     }
 
-    /* register internal conn_idx component */
+    /* register internal connection component (sh2_conn_t) with destructor */
     {
-        shift_component_info_t ci = { .element_size = sizeof(sh2_conn_idx_t) };
+        shift_component_info_t ci = {
+            .element_size = sizeof(sh2_conn_t),
+            .destructor   = conn_dtor,
+        };
         if (shift_component_register(ctx->shift, &ci,
-                                      &ctx->internal_conn_idx) != shift_ok) {
+                                      &ctx->internal_conn) != shift_ok) {
             free(ctx);
             return sh2_error_invalid;
         }
     }
 
-    /* create sio result collections */
+    /* register internal hostname component for connect entities */
+    {
+        shift_component_info_t ci = {
+            .element_size = sizeof(sh2_hostname_t),
+            .destructor   = hostname_dtor,
+        };
+        if (shift_component_register(ctx->shift, &ci,
+                                      &ctx->internal_hostname) != shift_ok) {
+            free(ctx);
+            return sh2_error_invalid;
+        }
+    }
+
+    /* create sio result collections — connection_results now carries
+     * the internal_conn component so sio's connections collection
+     * (via superset) also has it. */
     {
         shift_component_id_t comps[] = {
             ctx->sio_comp_ids.conn_entity,
-            ctx->internal_conn_idx,
+            ctx->internal_conn,
         };
         shift_collection_info_t ci = {
             .name       = "sio_connection_results",
@@ -209,6 +266,7 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             ctx->sio_comp_ids.io_result,
             ctx->sio_comp_ids.conn_entity,
             ctx->sio_comp_ids.user_conn_entity,
+            ctx->internal_hostname,
         };
         shift_collection_info_t ci = {
             .name       = "sio_connect_results",
@@ -247,7 +305,7 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
 
     /* internal collection: response_sending
      * Mirror response_in's component list so user-added components
-     * survive the response_in → response_sending → stream_result_out
+     * survive the response_in → response_sending → response_out
      * pipeline without being destructed. */
     {
         const shift_component_id_t *resp_comps = NULL;
@@ -267,6 +325,30 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         if (shift_collection_register(ctx->shift, &ci,
                                       &ctx->coll_response_sending) != shift_ok) {
             sio_context_destroy(ctx->sio);
+            free(ctx);
+            return sh2_error_invalid;
+        }
+    }
+
+    /* connection state collections (same archetype as sio_connection_results) */
+    {
+        shift_component_id_t comps[] = {
+            ctx->sio_comp_ids.conn_entity,
+            ctx->internal_conn,
+        };
+        uint32_t ncomps = sizeof(comps) / sizeof(comps[0]);
+        shift_collection_info_t ci_active = { .name = "conn_active",
+            .comp_ids = comps, .comp_count = ncomps };
+        shift_collection_info_t ci_hs = { .name = "conn_tls_handshake",
+            .comp_ids = comps, .comp_count = ncomps };
+        shift_collection_info_t ci_drain = { .name = "conn_draining",
+            .comp_ids = comps, .comp_count = ncomps };
+        if (shift_collection_register(ctx->shift, &ci_active,
+                                      &ctx->coll_conn_active) != shift_ok ||
+            shift_collection_register(ctx->shift, &ci_hs,
+                                      &ctx->coll_conn_tls_handshake) != shift_ok ||
+            shift_collection_register(ctx->shift, &ci_drain,
+                                      &ctx->coll_conn_draining) != shift_ok) {
             free(ctx);
             return sh2_error_invalid;
         }
@@ -298,20 +380,12 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         }
     }
 
-    /* connections array */
     ctx->max_connections = cfg->max_connections;
-    ctx->conns = calloc(cfg->max_connections, sizeof(sh2_conn_t));
-    if (!ctx->conns) {
-        sio_context_destroy(ctx->sio);
-        free(ctx);
-        return sh2_error_oom;
-    }
 
     /* nghttp2 server callbacks */
     sh2_result_t r = sh2_nghttp2_init_callbacks(ctx);
     if (r != sh2_ok) {
         sio_context_destroy(ctx->sio);
-        free(ctx->conns);
         free(ctx);
         return r;
     }
@@ -322,7 +396,6 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         r = sh2_nghttp2_client_init_callbacks(ctx);
         if (r != sh2_ok) {
             sio_context_destroy(ctx->sio);
-            free(ctx->conns);
             nghttp2_session_callbacks_del(ctx->ng_callbacks);
             free(ctx);
             return r;
@@ -345,7 +418,6 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             if (shift_collection_register(ctx->shift, &ci,
                                           &ctx->coll_client_request_sending) != shift_ok) {
                 sio_context_destroy(ctx->sio);
-                free(ctx->conns);
                 nghttp2_session_callbacks_del(ctx->ng_callbacks);
                 nghttp2_session_callbacks_del(ctx->ng_client_callbacks);
                 free(ctx);
@@ -370,7 +442,6 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
                 shift_collection_register(ctx->shift, &ci_hs,
                                           &ctx->coll_read_client_handshake) != shift_ok) {
                 sio_context_destroy(ctx->sio);
-                free(ctx->conns);
                 nghttp2_session_callbacks_del(ctx->ng_callbacks);
                 nghttp2_session_callbacks_del(ctx->ng_client_callbacks);
                 free(ctx);
@@ -398,7 +469,6 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         if (shift_collection_register(ctx->shift, &ci,
                                       &ctx->coll_read_handshake) != shift_ok) {
             sio_context_destroy(ctx->sio);
-            free(ctx->conns);
             nghttp2_session_callbacks_del(ctx->ng_callbacks);
             free(ctx);
             return sh2_error_invalid;
@@ -407,7 +477,6 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         r = sh2_tls_init(ctx);
         if (r != sh2_ok) {
             sio_context_destroy(ctx->sio);
-            free(ctx->conns);
             nghttp2_session_callbacks_del(ctx->ng_callbacks);
             free(ctx);
             return r;
@@ -419,7 +488,6 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         r = sh2_tls_client_init(ctx);
         if (r != sh2_ok) {
             sio_context_destroy(ctx->sio);
-            free(ctx->conns);
             nghttp2_session_callbacks_del(ctx->ng_callbacks);
             if (ctx->ng_client_callbacks)
                 nghttp2_session_callbacks_del(ctx->ng_client_callbacks);
@@ -437,13 +505,30 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
 void sh2_context_destroy(sh2_context_t *ctx) {
     if (!ctx) return;
 
-    for (uint32_t i = 0; i < ctx->max_connections; i++) {
+    /* Tear down connections in state collections.
+     * The conn_dtor destructor handles cleanup as a safety net, but we
+     * do controlled shutdown (nghttp2 terminate + flush) first. */
+    {
+        shift_collection_id_t state_colls[] = {
+            ctx->coll_conn_active,
+            ctx->coll_conn_tls_handshake,
+            ctx->coll_conn_draining,
+        };
+        for (uint32_t c = 0; c < sizeof(state_colls) / sizeof(state_colls[0]); c++) {
+            shift_entity_t *entities = NULL;
+            size_t count = 0;
+            shift_collection_get_entities(ctx->shift, state_colls[c],
+                                          &entities, &count);
+            for (size_t i = 0; i < count; i++) {
+                sh2_conn_t *conn = sh2_conn_get(ctx, entities[i]);
+                if (!conn) continue;
 #ifdef SH2_HAS_TLS
-        sh2_tls_conn_destroy(ctx, i);
+                sh2_tls_conn_destroy(conn);
 #endif
-        if (ctx->conns[i].ng_session)
-            sh2_nghttp2_session_destroy(ctx, i);
-        free(ctx->conns[i].hostname);
+                if (conn->ng_session)
+                    sh2_nghttp2_session_destroy(ctx, entities[i]);
+            }
+        }
     }
 
     shift_flush(ctx->shift);
@@ -479,7 +564,6 @@ void sh2_context_destroy(sh2_context_t *ctx) {
     if (ctx->ng_client_callbacks)
         nghttp2_session_callbacks_del(ctx->ng_client_callbacks);
 
-    free(ctx->conns);
     free(ctx);
 }
 

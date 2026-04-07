@@ -1,26 +1,15 @@
 #include "sh2_nghttp2.h"
 
 #include <assert.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-
-#define SH2_CHECK(expr, msg) do {                                    \
-    shift_result_t _r = (expr);                                      \
-    if (_r != shift_ok) {                                            \
-      fprintf(stderr, "FATAL [%s:%d] %s failed: %d\n",              \
-              __FILE__, __LINE__, (msg), _r);                        \
-      abort();                                                       \
-    }                                                                \
-  } while (0)
 
 /* --------------------------------------------------------------------------
  * Stream helpers
  * -------------------------------------------------------------------------- */
 
-sh2_stream_t *sh2_stream_alloc(uint32_t conn_idx) {
+sh2_stream_t *sh2_stream_alloc(shift_entity_t user_conn_entity) {
     sh2_stream_t *s = calloc(1, sizeof(*s));
-    if (s) s->conn_idx = conn_idx;
+    if (s) s->user_conn_entity = user_conn_entity;
     return s;
 }
 
@@ -29,6 +18,7 @@ void sh2_stream_free(sh2_stream_t *s) {
     free(s->hdr_fields);
     free(s->hdr_strbuf);
     free(s->body_data);
+    free(s->resp_data);
     free(s);
 }
 
@@ -126,6 +116,7 @@ bool sh2_stream_body_append(sh2_stream_t *s,
 static void stream_emit_request(sh2_context_t *ctx, sh2_stream_t *stream,
                                 int32_t stream_id) {
     shift_t *sh = ctx->shift;
+    sh2_conn_t *conn = sh2_conn_get(ctx, stream->user_conn_entity);
 
     shift_entity_t entity;
     SH2_CHECK(shift_entity_create_one_begin(sh, ctx->coll_ids.request_out,
@@ -144,7 +135,7 @@ static void stream_emit_request(sh2_context_t *ctx, sh2_stream_t *stream,
     SH2_CHECK(shift_entity_get_component(sh, entity, ctx->comp_ids.session,
                                           (void **)&sess),
               "get session component");
-    sess->entity = ctx->conns[stream->conn_idx].user_conn_entity;
+    sess->entity = stream->user_conn_entity;
 
     /* req_headers — finalize and transfer ownership */
     uint32_t hdr_count = 0;
@@ -174,9 +165,9 @@ static void stream_emit_request(sh2_context_t *ctx, sh2_stream_t *stream,
                                           (void **)&dt),
               "get domain_tag component");
 #ifdef SH2_HAS_TLS
-    dt->tag = ctx->conns[stream->conn_idx].tls
-            ? ctx->conns[stream->conn_idx].tls->domain_tag : 0;
+    dt->tag = (conn && conn->tls) ? conn->tls->domain_tag : 0;
 #else
+    (void)conn;
     dt->tag = 0;
 #endif
 
@@ -187,9 +178,8 @@ static void stream_emit_request(sh2_context_t *ctx, sh2_stream_t *stream,
                                           (void **)&pc),
               "get peer_cert component");
 #ifdef SH2_HAS_TLS
-    if (ctx->conns[stream->conn_idx].tls &&
-        ctx->conns[stream->conn_idx].tls->peer_cert.present) {
-        const sh2_peer_cert_t *src = &ctx->conns[stream->conn_idx].tls->peer_cert;
+    if (conn && conn->tls && conn->tls->peer_cert.present) {
+        const sh2_peer_cert_t *src = &conn->tls->peer_cert;
         pc->present    = true;
         pc->subject_cn = src->subject_cn ? strdup(src->subject_cn) : NULL;
         pc->subject_dn = src->subject_dn ? strdup(src->subject_dn) : NULL;
@@ -216,7 +206,7 @@ static int on_begin_headers(nghttp2_session *session,
         return 0;
 
     sh2_ng_ctx_t *nctx = user_data;
-    sh2_stream_t *stream = sh2_stream_alloc(nctx->conn_idx);
+    sh2_stream_t *stream = sh2_stream_alloc(nctx->user_conn_entity);
     if (!stream)
         return NGHTTP2_ERR_CALLBACK_FAILURE;
 
@@ -242,9 +232,9 @@ static int on_header(nghttp2_session *session, const nghttp2_frame *frame,
     return 0;
 }
 
-static int on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
-                              int32_t stream_id, const uint8_t *data,
-                              size_t len, void *user_data) {
+int sh2_on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
+                           int32_t stream_id, const uint8_t *data,
+                           size_t len, void *user_data) {
     (void)flags; (void)user_data;
     sh2_stream_t *stream = nghttp2_session_get_stream_user_data(
         session, stream_id);
@@ -274,8 +264,8 @@ static int on_frame_recv(nghttp2_session *session,
     return 0;
 }
 
-static void stream_finish(sh2_context_t *ctx, sh2_stream_t *stream,
-                          uint32_t error_code) {
+void sh2_stream_finish(sh2_context_t *ctx, sh2_stream_t *stream,
+                       uint32_t error_code, shift_collection_id_t dest) {
     shift_t *sh = ctx->shift;
 
     sh2_io_result_t *io = NULL;
@@ -284,8 +274,7 @@ static void stream_finish(sh2_context_t *ctx, sh2_stream_t *stream,
               "get io_result (stream_finish)");
     io->error = error_code ? -1 : 0;
 
-    SH2_CHECK(shift_entity_move_one(sh, stream->entity,
-                          ctx->coll_ids.stream_result_out),
+    SH2_CHECK(shift_entity_move_one(sh, stream->entity, dest),
               "move entity to result_out (stream_finish)");
 }
 
@@ -298,8 +287,11 @@ static int on_stream_close(nghttp2_session *session, int32_t stream_id,
 
     if (stream->emitted) {
         /* if send isn't complete, treat as error regardless of error_code */
-        uint32_t ec = stream->send_complete ? error_code : (error_code ? error_code : 1);
-        stream_finish(nctx->ctx, stream, ec);
+        uint32_t ec = stream->send_complete
+            ? error_code
+            : (error_code ? error_code : SH2_ERR_SEND_INCOMPLETE);
+        sh2_stream_finish(nctx->ctx, stream, ec,
+                          nctx->ctx->coll_ids.response_out);
     }
 
     nghttp2_session_set_stream_user_data(session, stream_id, NULL);
@@ -331,8 +323,10 @@ nghttp2_ssize on_data_source_read(
          * it's safe to hand the entity back to the user */
         sh2_stream_t *stream = nghttp2_session_get_stream_user_data(
             session, stream_id);
-        if (stream)
+        if (stream) {
             stream->send_complete = true;
+            stream->resp_data    = NULL;
+        }
 
         free(rd);
     }
@@ -351,7 +345,7 @@ sh2_result_t sh2_nghttp2_init_callbacks(sh2_context_t *ctx) {
 
     nghttp2_session_callbacks_set_on_begin_headers_callback(cb, on_begin_headers);
     nghttp2_session_callbacks_set_on_header_callback(cb, on_header);
-    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, on_data_chunk_recv);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, sh2_on_data_chunk_recv);
     nghttp2_session_callbacks_set_on_frame_recv_callback(cb, on_frame_recv);
     nghttp2_session_callbacks_set_on_stream_close_callback(cb, on_stream_close);
 
@@ -359,13 +353,15 @@ sh2_result_t sh2_nghttp2_init_callbacks(sh2_context_t *ctx) {
     return sh2_ok;
 }
 
-sh2_result_t sh2_nghttp2_session_create(sh2_context_t *ctx, uint32_t conn_idx) {
-    sh2_conn_t *conn = &ctx->conns[conn_idx];
+sh2_result_t sh2_nghttp2_session_create(sh2_context_t *ctx,
+                                         shift_entity_t user_conn_entity) {
+    sh2_conn_t *conn = sh2_conn_get(ctx, user_conn_entity);
+    if (!conn) return sh2_error_invalid;
 
     sh2_ng_ctx_t *nctx = malloc(sizeof(*nctx));
     if (!nctx) return sh2_error_oom;
-    nctx->ctx      = ctx;
-    nctx->conn_idx = conn_idx;
+    nctx->ctx              = ctx;
+    nctx->user_conn_entity = user_conn_entity;
 
     int rv = nghttp2_session_server_new(&conn->ng_session,
                                         ctx->ng_callbacks, nctx);
@@ -386,13 +382,14 @@ sh2_result_t sh2_nghttp2_session_create(sh2_context_t *ctx, uint32_t conn_idx) {
     return sh2_ok;
 }
 
-void sh2_nghttp2_session_destroy(sh2_context_t *ctx, uint32_t conn_idx) {
-    sh2_conn_t *conn = &ctx->conns[conn_idx];
-    if (!conn->ng_session) return;
+void sh2_nghttp2_session_destroy(sh2_context_t *ctx,
+                                  shift_entity_t user_conn_entity) {
+    sh2_conn_t *conn = sh2_conn_get(ctx, user_conn_entity);
+    if (!conn || !conn->ng_session) return;
 
     /* Terminate session — this causes nghttp2 to mark all open streams
      * as closed, firing on_stream_close callbacks during the next
-     * mem_send so entities move to stream_result_out. */
+     * mem_send so entities move to response_out. */
     nghttp2_session_terminate_session(conn->ng_session, NGHTTP2_NO_ERROR);
 
     /* Drive the session to flush stream close callbacks */
@@ -414,9 +411,11 @@ void sh2_nghttp2_session_destroy(sh2_context_t *ctx, uint32_t conn_idx) {
 }
 
 /* Helper: submit a sio write entity with the given data buffer (takes ownership) */
-static sh2_result_t submit_write(sh2_context_t *ctx, uint32_t conn_idx,
+static sh2_result_t submit_write(sh2_context_t *ctx,
+                                  shift_entity_t user_conn_entity,
                                   void *data, uint32_t len) {
-    sh2_conn_t *conn = &ctx->conns[conn_idx];
+    sh2_conn_t *conn = sh2_conn_get(ctx, user_conn_entity);
+    if (!conn) return sh2_error_invalid;
     shift_t *sh = ctx->shift;
     const sio_collection_ids_t *sio_colls = sio_get_collection_ids(ctx->sio);
 
@@ -442,16 +441,17 @@ static sh2_result_t submit_write(sh2_context_t *ctx, uint32_t conn_idx,
     SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.user_conn_entity,
                                           (void **)&uce),
               "get user_conn_entity component (write)");
-    uce->entity = conn->user_conn_entity;
+    uce->entity = user_conn_entity;
 
     SH2_CHECK(shift_entity_create_one_end(sh, we), "create_end write entity");
     conn->pending_writes++;
     return sh2_ok;
 }
 
-sh2_result_t sh2_drive_send(sh2_context_t *ctx, uint32_t conn_idx) {
-    sh2_conn_t *conn = &ctx->conns[conn_idx];
-    if (!conn->ng_session)
+sh2_result_t sh2_drive_send(sh2_context_t *ctx,
+                             shift_entity_t user_conn_entity) {
+    sh2_conn_t *conn = sh2_conn_get(ctx, user_conn_entity);
+    if (!conn || !conn->ng_session)
         return sh2_ok;
 
     shift_t *sh = ctx->shift;
@@ -485,13 +485,13 @@ sh2_result_t sh2_drive_send(sh2_context_t *ctx, uint32_t conn_idx) {
         if (accum_len > 0) {
             uint8_t *cipher = NULL;
             uint32_t cipher_len = 0;
-            sh2_result_t r = sh2_tls_encrypt(ctx, conn_idx, accum, (uint32_t)accum_len,
+            sh2_result_t r = sh2_tls_encrypt(conn, accum, (uint32_t)accum_len,
                                               &cipher, &cipher_len);
             free(accum);
             if (r != sh2_ok) return r;
 
             if (cipher && cipher_len > 0) {
-                r = submit_write(ctx, conn_idx, cipher, cipher_len);
+                r = submit_write(ctx, user_conn_entity, cipher, cipher_len);
                 if (r != sh2_ok) { free(cipher); return r; }
             }
         } else {
@@ -513,45 +513,47 @@ sh2_result_t sh2_drive_send(sh2_context_t *ctx, uint32_t conn_idx) {
             if (!copy) return sh2_error_oom;
             memcpy(copy, data, (size_t)len);
 
-            sh2_result_t r = submit_write(ctx, conn_idx, copy, (uint32_t)len);
+            sh2_result_t r = submit_write(ctx, user_conn_entity, copy, (uint32_t)len);
             if (r != sh2_ok) { free(copy); return r; }
         }
     }
 
+    /* Re-fetch conn after potential flush in submit_write */
+    conn = sh2_conn_get(ctx, user_conn_entity);
+    if (!conn) return sh2_ok;
+
     /* check if session is done — defer fd close until writes complete */
     if (!nghttp2_session_want_read(conn->ng_session) &&
         !nghttp2_session_want_write(conn->ng_session)) {
-        /* mark closed so no more reads are processed */
-        if (!shift_entity_is_stale(sh, conn->user_conn_entity)) {
-            sh2_conn_idx_t *cidx = NULL;
-            SH2_CHECK(shift_entity_get_component(sh, conn->user_conn_entity,
-                                                  ctx->internal_conn_idx, (void **)&cidx),
-                      "get conn_idx (drive_send close)");
-            cidx->state = SH2_CONN_CLOSED;
-        }
-        sh2_nghttp2_session_destroy(ctx, conn_idx);
+        sh2_nghttp2_session_destroy(ctx, user_conn_entity);
+
+        /* Re-fetch after session_destroy flush */
+        conn = sh2_conn_get(ctx, user_conn_entity);
+        if (!conn) return sh2_ok;
 
         if (conn->pending_writes > 0) {
-            conn->draining = true;
+            /* move to draining — writes_finalize_draining will clean up */
+            SH2_CHECK(shift_entity_move_one(sh, user_conn_entity,
+                          ctx->coll_conn_draining),
+                      "move to draining (drive_send)");
         } else {
-            /* no pending writes — close fd immediately */
+            /* no pending writes — destroy connection entities immediately */
             if (!shift_entity_is_stale(sh, conn->conn_entity))
                 SH2_CHECK(shift_entity_destroy_one(sh, conn->conn_entity),
                           "destroy conn_entity (drive_send)");
-            if (!shift_entity_is_stale(sh, conn->user_conn_entity))
-                SH2_CHECK(shift_entity_destroy_one(sh, conn->user_conn_entity),
+            if (!shift_entity_is_stale(sh, user_conn_entity))
+                SH2_CHECK(shift_entity_destroy_one(sh, user_conn_entity),
                           "destroy user_conn_entity (drive_send)");
-            free(conn->hostname);
-            *conn = (sh2_conn_t){0};
         }
     }
 
     return sh2_ok;
 }
 
-void sh2_conn_close(sh2_context_t *ctx, uint32_t conn_idx) {
-    sh2_conn_t *conn = &ctx->conns[conn_idx];
-    if (!conn->ng_session && !conn->draining
+void sh2_conn_close(sh2_context_t *ctx, shift_entity_t user_conn_entity) {
+    sh2_conn_t *conn = sh2_conn_get(ctx, user_conn_entity);
+    if (!conn) return;
+    if (!conn->ng_session
 #ifdef SH2_HAS_TLS
         && !conn->tls
 #endif
@@ -559,30 +561,20 @@ void sh2_conn_close(sh2_context_t *ctx, uint32_t conn_idx) {
 
     shift_t *sh = ctx->shift;
 
-    /* mark conn_idx as closed so stale reads are discarded */
-    if (!shift_entity_is_stale(sh, conn->user_conn_entity)) {
-        sh2_conn_idx_t *cidx = NULL;
-        SH2_CHECK(shift_entity_get_component(sh, conn->user_conn_entity,
-                                              ctx->internal_conn_idx, (void **)&cidx),
-                  "get conn_idx (conn_close)");
-        cidx->state = SH2_CONN_CLOSED;
-    }
-
 #ifdef SH2_HAS_TLS
-    sh2_tls_conn_destroy(ctx, conn_idx);
+    sh2_tls_conn_destroy(conn);
 #endif
 
-    sh2_nghttp2_session_destroy(ctx, conn_idx);
+    sh2_nghttp2_session_destroy(ctx, user_conn_entity);
 
-    /* destroy sio entities — triggers fd close */
-    if (!shift_entity_is_stale(sh, conn->conn_entity))
+    /* Re-fetch after session_destroy flush */
+    conn = sh2_conn_get(ctx, user_conn_entity);
+
+    /* destroy sio entities — triggers fd close via conn_dtor */
+    if (conn && !shift_entity_is_stale(sh, conn->conn_entity))
         SH2_CHECK(shift_entity_destroy_one(sh, conn->conn_entity),
                   "destroy conn_entity (conn_close)");
-    if (!shift_entity_is_stale(sh, conn->user_conn_entity))
-        SH2_CHECK(shift_entity_destroy_one(sh, conn->user_conn_entity),
+    if (!shift_entity_is_stale(sh, user_conn_entity))
+        SH2_CHECK(shift_entity_destroy_one(sh, user_conn_entity),
                   "destroy user_conn_entity (conn_close)");
-
-    free(conn->hostname);
-    *conn = (sh2_conn_t){0};
 }
-

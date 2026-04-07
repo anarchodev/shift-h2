@@ -39,6 +39,10 @@ add_library(shift_h2 STATIC
     src/sh2_nghttp2.c
     src/sh2_nghttp2_client.c
     src/sh2_poll.c
+    src/sh2_read_pipeline.c
+    src/sh2_write_pipeline.c
+    src/sh2_client_poll.c
+    src/sh2_conn_transitions.c
 )
 target_include_directories(shift_h2
     PUBLIC  include/

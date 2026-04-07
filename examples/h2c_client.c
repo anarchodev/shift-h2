@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
     shift_config_t sh_cfg = {
         .max_entities            = 4096,
         .max_components          = 32,
-        .max_collections         = 32,
+        .max_collections         = 64,
         .deferred_queue_capacity = 4096,
     };
     if (shift_context_create(&sh_cfg, &sh) != shift_ok) {
@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
         comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
         comp.domain_tag, comp.peer_cert,
     };
-    shift_collection_id_t request_out, response_in, stream_result_out;
+    shift_collection_id_t request_out, response_in, response_out;
     {
         shift_collection_info_t ci = {
             .name = "request_out", .comp_ids = all_comps,
@@ -70,32 +70,32 @@ int main(int argc, char **argv) {
             .comp_count = sizeof(all_comps) / sizeof(all_comps[0]),
         };
         shift_collection_info_t ci3 = {
-            .name = "stream_result_out", .comp_ids = all_comps,
+            .name = "response_out", .comp_ids = all_comps,
             .comp_count = sizeof(all_comps) / sizeof(all_comps[0]),
         };
         shift_collection_register(sh, &ci, &request_out);
         shift_collection_register(sh, &ci2, &response_in);
-        shift_collection_register(sh, &ci3, &stream_result_out);
+        shift_collection_register(sh, &ci3, &response_out);
     }
 
     /* ---- client-path collections ---- */
     shift_component_id_t connect_comps[] = {
         comp.connect_target, comp.session, comp.io_result,
     };
-    shift_collection_id_t connect_out, connect_result_out, connect_close_in;
+    shift_collection_id_t connect_in, connect_out, disconnect_in;
     shift_collection_id_t client_request_in, client_cancel_in;
-    shift_collection_id_t client_response_out, client_result_out;
+    shift_collection_id_t client_response_out;
     {
         shift_collection_info_t ci_co = {
-            .name = "connect_out", .comp_ids = connect_comps,
+            .name = "connect_in", .comp_ids = connect_comps,
             .comp_count = sizeof(connect_comps) / sizeof(connect_comps[0]),
         };
         shift_collection_info_t ci_cr = {
-            .name = "connect_result_out", .comp_ids = all_comps,
+            .name = "connect_out", .comp_ids = all_comps,
             .comp_count = sizeof(all_comps) / sizeof(all_comps[0]),
         };
         shift_collection_info_t ci_cc = {
-            .name = "connect_close_in", .comp_ids = all_comps,
+            .name = "disconnect_in", .comp_ids = all_comps,
             .comp_count = sizeof(all_comps) / sizeof(all_comps[0]),
         };
         shift_collection_info_t ci_ri = {
@@ -110,17 +110,12 @@ int main(int argc, char **argv) {
             .name = "client_response_out", .comp_ids = all_comps,
             .comp_count = sizeof(all_comps) / sizeof(all_comps[0]),
         };
-        shift_collection_info_t ci_rr = {
-            .name = "client_result_out", .comp_ids = all_comps,
-            .comp_count = sizeof(all_comps) / sizeof(all_comps[0]),
-        };
-        shift_collection_register(sh, &ci_co, &connect_out);
-        shift_collection_register(sh, &ci_cr, &connect_result_out);
-        shift_collection_register(sh, &ci_cc, &connect_close_in);
+        shift_collection_register(sh, &ci_co, &connect_in);
+        shift_collection_register(sh, &ci_cr, &connect_out);
+        shift_collection_register(sh, &ci_cc, &disconnect_in);
         shift_collection_register(sh, &ci_ri, &client_request_in);
         shift_collection_register(sh, &ci_ci, &client_cancel_in);
         shift_collection_register(sh, &ci_ro, &client_response_out);
-        shift_collection_register(sh, &ci_rr, &client_result_out);
     }
 
     /* ---- create sh2 context ---- */
@@ -134,16 +129,15 @@ int main(int argc, char **argv) {
         .buf_size            = BUF_SIZE,
         .request_out         = request_out,
         .response_in         = response_in,
-        .stream_result_out = stream_result_out,
+        .response_out      = response_out,
         .enable_connect      = true,
         .client_colls = {
+            .connect_in          = connect_in,
             .connect_out         = connect_out,
-            .connect_result_out  = connect_result_out,
-            .connect_close_in    = connect_close_in,
+            .disconnect_in       = disconnect_in,
             .request_in          = client_request_in,
             .cancel_in           = client_cancel_in,
             .response_out        = client_response_out,
-            .stream_result_out = client_result_out,
         },
     };
     sh2_result_t r = sh2_context_create(&cfg, &ctx);
@@ -164,7 +158,7 @@ int main(int argc, char **argv) {
     /* create connect entity */
     {
         shift_entity_t ce;
-        shift_entity_create_one_begin(sh, connect_out, &ce);
+        shift_entity_create_one_begin(sh, connect_in, &ce);
 
         sh2_connect_target_t *tgt = NULL;
         shift_entity_get_component(sh, ce, comp.connect_target, (void **)&tgt);
@@ -184,11 +178,11 @@ int main(int argc, char **argv) {
         if (sh2_poll(ctx, 0) != sh2_ok)
             break;
 
-        /* check connect_result_out */
+        /* check connect_out */
         if (!connected) {
             shift_entity_t *entities = NULL;
             size_t count = 0;
-            shift_collection_get_entities(sh, connect_result_out,
+            shift_collection_get_entities(sh, connect_out,
                                           &entities, &count);
             for (size_t i = 0; i < count; i++) {
                 sh2_io_result_t *io = NULL;
@@ -248,20 +242,11 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* check client_response_out */
-        if (request_sent) {
-            shift_entity_t *entities = NULL;
-            size_t count = 0;
-            shift_collection_get_entities(sh, client_response_out,
-                                          &entities, &count);
-            /* responses just accumulate — we read them from result_out */
-        }
-
-        /* check client_result_out */
+        /* check client_response_out for completed responses */
         {
             shift_entity_t *entities = NULL;
             size_t count = 0;
-            shift_collection_get_entities(sh, client_result_out,
+            shift_collection_get_entities(sh, client_response_out,
                                           &entities, &count);
             for (size_t i = 0; i < count; i++) {
                 sh2_status_t *st = NULL;

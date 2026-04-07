@@ -134,28 +134,36 @@ typedef struct {
      *   sending collection until the stream closes. */
     shift_collection_id_t response_in;
 
-    /* stream_result_out: stream fully closed (io_result.error == 0) or
-     *   failed (io_result.error < 0).
+    /* response_out: stream complete — response sent (io_result.error == 0)
+     *   or stream failed (io_result.error < 0).
      *   Required components: same as response_in.
-     *   App frees resp_headers/resp_body memory and destroys entity. */
-    shift_collection_id_t stream_result_out;
+     *   App destroys entity when done. */
+    shift_collection_id_t response_out;
+
+    /* connection_close_out: connection ended — delivered with close reason.
+     *   (Reserved — not yet populated by sh2.) */
+    shift_collection_id_t connection_close_out;
 } sh2_collection_ids_t;
 
 /* Client (outgoing) collection IDs — only valid when enable_connect is true. */
 typedef struct {
-    /* connect_out: app creates entities with sh2_connect_target_t here to
+    /* connect_in: app creates entities with sh2_connect_target_t here to
      *   initiate an outgoing TCP connection. */
+    shift_collection_id_t connect_in;
+
+    /* connect_out: connection established (io_result.error == 0) or
+     *   failed (io_result.error < 0).  On success, session.entity is set. */
     shift_collection_id_t connect_out;
 
-    /* connect_result_out: connection established (io_result.error == 0) or
-     *   failed (io_result.error < 0).  On success, session.entity is set. */
-    shift_collection_id_t connect_result_out;
-
-    /* connect_close_in: app moves an entity here to gracefully close a
+    /* disconnect_in: app creates an entity here to gracefully close a
      *   connection.  Required components: {session}.
      *   sh2 sends GOAWAY and lets in-flight streams drain.  The entity is
      *   destroyed after the GOAWAY is submitted. */
-    shift_collection_id_t connect_close_in;
+    shift_collection_id_t disconnect_in;
+
+    /* connection_close_out: connection ended — delivered with close reason.
+     *   (Reserved — not yet populated by sh2.) */
+    shift_collection_id_t connection_close_out;
 
     /* request_in: app deposits request-ready entities here.
      *   Required components: {session, req_headers, req_body}.
@@ -164,17 +172,14 @@ typedef struct {
 
     /* cancel_in: app moves in-flight request entities here to cancel.
      *   Required components: {stream_id, session}.
-     *   sh2 sends RST_STREAM and moves the entity to stream_result_out
+     *   sh2 sends RST_STREAM and moves the entity to response_out
      *   with io_result.error = -1. */
     shift_collection_id_t cancel_in;
 
-    /* response_out: completed response entities delivered here.
-     *   Components: {stream_id, session, resp_headers, resp_body, status}. */
+    /* response_out: stream complete — response received + close status.
+     *   Components: {stream_id, session, resp_headers, resp_body, status,
+     *                io_result}.  App destroys entity when done. */
     shift_collection_id_t response_out;
-
-    /* stream_result_out: stream fully closed — app destroys entity.
-     *   Components: same as response_out + io_result. */
-    shift_collection_id_t stream_result_out;
 } sh2_client_collection_ids_t;
 
 /* --------------------------------------------------------------------------
@@ -263,7 +268,7 @@ typedef struct {
      * and preserved across entity moves. */
     shift_collection_id_t request_out;
     shift_collection_id_t response_in;
-    shift_collection_id_t stream_result_out;
+    shift_collection_id_t response_out;
 #ifdef SH2_HAS_TLS
     /* TLS configuration — NULL = cleartext h2c.  Non-NULL enables TLS
      * with ALPN h2 negotiation and SNI-based certificate selection. */

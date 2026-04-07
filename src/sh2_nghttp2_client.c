@@ -1,23 +1,12 @@
 #include "sh2_nghttp2_client.h"
 #include "sh2_nghttp2.h"
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-
-#define SH2_CHECK(expr, msg) do {                                    \
-    shift_result_t _r = (expr);                                      \
-    if (_r != shift_ok) {                                            \
-      fprintf(stderr, "FATAL [%s:%d] %s failed: %d\n",              \
-              __FILE__, __LINE__, (msg), _r);                        \
-      abort();                                                       \
-    }                                                                \
-  } while (0)
 
 /* --------------------------------------------------------------------------
  * Populate response components on the existing request entity.
  * The entity stays in coll_client_request_sending — the single move to
- * stream_result_out happens in stream_finish_client when the stream closes.
+ * response_out happens in stream_finish_client when the stream closes.
  * -------------------------------------------------------------------------- */
 
 static void stream_emit_response(sh2_context_t *ctx, sh2_stream_t *stream) {
@@ -73,7 +62,7 @@ static int on_begin_headers_client(nghttp2_session *session,
 
     /* fallback: allocate for streams we didn't initiate (e.g. server push) */
     sh2_ng_ctx_t *nctx = user_data;
-    stream = sh2_stream_alloc(nctx->conn_idx);
+    stream = sh2_stream_alloc(nctx->user_conn_entity);
     if (!stream)
         return NGHTTP2_ERR_CALLBACK_FAILURE;
 
@@ -105,20 +94,6 @@ static int on_header_client(nghttp2_session *session,
     return 0;
 }
 
-static int on_data_chunk_recv_client(nghttp2_session *session, uint8_t flags,
-                                     int32_t stream_id, const uint8_t *data,
-                                     size_t len, void *user_data) {
-    (void)flags; (void)user_data;
-    sh2_stream_t *stream = nghttp2_session_get_stream_user_data(
-        session, stream_id);
-    if (!stream) return 0;
-
-    if (!sh2_stream_body_append(stream, data, len))
-        return NGHTTP2_ERR_CALLBACK_FAILURE;
-
-    return 0;
-}
-
 static int on_frame_recv_client(nghttp2_session *session,
                                 const nghttp2_frame *frame,
                                 void *user_data) {
@@ -138,21 +113,6 @@ static int on_frame_recv_client(nghttp2_session *session,
     return 0;
 }
 
-static void stream_finish_client(sh2_context_t *ctx, sh2_stream_t *stream,
-                                 uint32_t error_code) {
-    shift_t *sh = ctx->shift;
-
-    sh2_io_result_t *io = NULL;
-    SH2_CHECK(shift_entity_get_component(sh, stream->entity, ctx->comp_ids.io_result,
-                                          (void **)&io),
-              "get io_result (client stream_finish)");
-    io->error = error_code ? -1 : 0;
-
-    SH2_CHECK(shift_entity_move_one(sh, stream->entity,
-                          ctx->coll_ids_client.stream_result_out),
-              "move entity to client result_out");
-}
-
 static int on_stream_close_client(nghttp2_session *session, int32_t stream_id,
                                   uint32_t error_code, void *user_data) {
     sh2_ng_ctx_t *nctx = user_data;
@@ -160,7 +120,8 @@ static int on_stream_close_client(nghttp2_session *session, int32_t stream_id,
         session, stream_id);
     if (!stream) return 0;
 
-    stream_finish_client(nctx->ctx, stream, error_code);
+    sh2_stream_finish(nctx->ctx, stream, error_code,
+                      nctx->ctx->coll_ids_client.response_out);
 
     nghttp2_session_set_stream_user_data(session, stream_id, NULL);
     sh2_stream_free(stream);
@@ -178,7 +139,7 @@ sh2_result_t sh2_nghttp2_client_init_callbacks(sh2_context_t *ctx) {
 
     nghttp2_session_callbacks_set_on_begin_headers_callback(cb, on_begin_headers_client);
     nghttp2_session_callbacks_set_on_header_callback(cb, on_header_client);
-    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, on_data_chunk_recv_client);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, sh2_on_data_chunk_recv);
     nghttp2_session_callbacks_set_on_frame_recv_callback(cb, on_frame_recv_client);
     nghttp2_session_callbacks_set_on_stream_close_callback(cb, on_stream_close_client);
 
@@ -187,13 +148,14 @@ sh2_result_t sh2_nghttp2_client_init_callbacks(sh2_context_t *ctx) {
 }
 
 sh2_result_t sh2_nghttp2_client_session_create(sh2_context_t *ctx,
-                                                uint32_t conn_idx) {
-    sh2_conn_t *conn = &ctx->conns[conn_idx];
+                                                shift_entity_t user_conn_entity) {
+    sh2_conn_t *conn = sh2_conn_get(ctx, user_conn_entity);
+    if (!conn) return sh2_error_invalid;
 
     sh2_ng_ctx_t *nctx = malloc(sizeof(*nctx));
     if (!nctx) return sh2_error_oom;
-    nctx->ctx      = ctx;
-    nctx->conn_idx = conn_idx;
+    nctx->ctx              = ctx;
+    nctx->user_conn_entity = user_conn_entity;
 
     int rv = nghttp2_session_client_new(&conn->ng_session,
                                         ctx->ng_client_callbacks, nctx);

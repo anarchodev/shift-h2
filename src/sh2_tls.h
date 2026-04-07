@@ -7,8 +7,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* shift_h2.h is already included by shift_h2_internal.h before this header */
+/* This header is included from shift_h2_internal.h.
+ * shift_h2.h provides sh2_result_t, sh2_peer_cert_t, sh2_sni_callback_t, etc. */
+#include <shift_h2.h>
 typedef struct sh2_context sh2_context_t;
+struct sh2_conn; /* forward declaration — defined in shift_h2_internal.h */
 
 /* Per-certificate storage (parsed once at registration time) */
 typedef struct {
@@ -37,12 +40,12 @@ struct sh2_tls_client_config {
 };
 
 /* Per-connection TLS state */
-typedef struct {
+typedef struct sh2_tls_conn {
     SSL     *ssl;
     BIO     *rbio;          /* raw TCP → SSL_read() */
     BIO     *wbio;          /* SSL_write() → raw TCP */
     uint64_t domain_tag;    /* set during SNI callback */
-    bool     handshake_done;
+    bool     handshake_complete; /* internal — use sh2_tls_feed return value */
     /* peer certificate info — extracted once at handshake completion */
     sh2_peer_cert_t peer_cert;
 } sh2_tls_conn_t;
@@ -55,32 +58,35 @@ void         sh2_tls_cleanup(sh2_context_t *ctx);
 sh2_result_t sh2_tls_client_init(sh2_context_t *ctx);
 void         sh2_tls_client_cleanup(sh2_context_t *ctx);
 
-/* Per-connection client TLS lifecycle */
-sh2_result_t sh2_tls_client_conn_create(sh2_context_t *ctx, uint32_t conn_idx,
+/* Per-connection lifecycle — take sh2_conn_t* directly */
+sh2_result_t sh2_tls_conn_create(sh2_context_t *ctx, struct sh2_conn *conn);
+sh2_result_t sh2_tls_client_conn_create(sh2_context_t *ctx, struct sh2_conn *conn,
                                          const char *hostname);
+void         sh2_tls_conn_destroy(struct sh2_conn *conn);
 
-/* Per-connection lifecycle */
-sh2_result_t sh2_tls_conn_create(sh2_context_t *ctx, uint32_t conn_idx);
-void         sh2_tls_conn_destroy(sh2_context_t *ctx, uint32_t conn_idx);
+/* Result of sh2_tls_feed — replaces handshake_done flag with return signal */
+typedef enum {
+    SH2_TLS_NEED_MORE,       /* handshake needs more data */
+    SH2_TLS_HANDSHAKE_DONE,  /* handshake just completed; decrypt_buf may have data */
+    SH2_TLS_DATA,            /* post-handshake; decrypted data in decrypt_buf */
+    SH2_TLS_ERROR,           /* fatal SSL error */
+} sh2_tls_feed_result_t;
 
 /* Feed raw TCP bytes, drive handshake or decrypt.
- * On success: *out_len bytes of decrypted plaintext written to decrypt_buf.
- *   out_len==0 with handshake_done==false means handshake needs more data.
- * Returns sh2_error_io on fatal SSL error. */
-sh2_result_t sh2_tls_feed(sh2_context_t *ctx, uint32_t conn_idx,
-                           const uint8_t *raw, uint32_t raw_len,
-                           uint8_t *decrypt_buf, uint32_t decrypt_buf_cap,
-                           uint32_t *out_len);
+ * On non-ERROR return: *out_len bytes of decrypted plaintext in decrypt_buf. */
+sh2_tls_feed_result_t sh2_tls_feed(struct sh2_conn *conn,
+                                    const uint8_t *raw, uint32_t raw_len,
+                                    uint8_t *decrypt_buf, uint32_t decrypt_buf_cap,
+                                    uint32_t *out_len);
 
 /* Encrypt plaintext via SSL_write, return ciphertext from wbio.
  * Caller owns *out_buf (malloc'd). */
-sh2_result_t sh2_tls_encrypt(sh2_context_t *ctx, uint32_t conn_idx,
+sh2_result_t sh2_tls_encrypt(struct sh2_conn *conn,
                               const uint8_t *plain, uint32_t plain_len,
                               uint8_t **out_buf, uint32_t *out_len);
 
 /* Drain pending data from wbio (handshake responses, alerts).
  * Returns malloc'd buffer or NULL if nothing pending. */
-uint8_t *sh2_tls_drain_wbio(sh2_context_t *ctx, uint32_t conn_idx,
-                             uint32_t *out_len);
+uint8_t *sh2_tls_drain_wbio(struct sh2_conn *conn, uint32_t *out_len);
 
 #endif /* SH2_HAS_TLS */

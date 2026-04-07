@@ -198,7 +198,7 @@ void sh2_tls_cleanup(sh2_context_t *ctx) {
  * Per-connection TLS lifecycle
  * -------------------------------------------------------------------------- */
 
-sh2_result_t sh2_tls_conn_create(sh2_context_t *ctx, uint32_t conn_idx) {
+sh2_result_t sh2_tls_conn_create(sh2_context_t *ctx, sh2_conn_t *conn) {
     sh2_tls_conn_t *tconn = calloc(1, sizeof(*tconn));
     if (!tconn) return sh2_error_oom;
 
@@ -220,19 +220,19 @@ sh2_result_t sh2_tls_conn_create(sh2_context_t *ctx, uint32_t conn_idx) {
     SSL_set_accept_state(tconn->ssl);
     SSL_set_app_data(tconn->ssl, tconn);
 
-    ctx->conns[conn_idx].tls = tconn;
+    conn->tls = tconn;
     return sh2_ok;
 }
 
 static void free_peer_cert(sh2_peer_cert_t *pc);
 
-void sh2_tls_conn_destroy(sh2_context_t *ctx, uint32_t conn_idx) {
-    sh2_tls_conn_t *tconn = ctx->conns[conn_idx].tls;
+void sh2_tls_conn_destroy(sh2_conn_t *conn) {
+    sh2_tls_conn_t *tconn = conn->tls;
     if (!tconn) return;
     free_peer_cert(&tconn->peer_cert);
     SSL_free(tconn->ssl); /* also frees rbio and wbio */
     free(tconn);
-    ctx->conns[conn_idx].tls = NULL;
+    conn->tls = NULL;
 }
 
 /* --------------------------------------------------------------------------
@@ -314,33 +314,34 @@ static void free_peer_cert(sh2_peer_cert_t *pc) {
  * Feed raw TCP data — handshake or decrypt
  * -------------------------------------------------------------------------- */
 
-sh2_result_t sh2_tls_feed(sh2_context_t *ctx, uint32_t conn_idx,
-                           const uint8_t *raw, uint32_t raw_len,
-                           uint8_t *decrypt_buf, uint32_t decrypt_buf_cap,
-                           uint32_t *out_len) {
-    (void)ctx;
-    sh2_tls_conn_t *tconn = ctx->conns[conn_idx].tls;
+sh2_tls_feed_result_t sh2_tls_feed(sh2_conn_t *conn,
+                                    const uint8_t *raw, uint32_t raw_len,
+                                    uint8_t *decrypt_buf, uint32_t decrypt_buf_cap,
+                                    uint32_t *out_len) {
+    sh2_tls_conn_t *tconn = conn->tls;
     *out_len = 0;
+    bool just_completed = false;
 
     /* push raw TCP bytes into the read BIO */
     if (raw_len > 0) {
         int written = BIO_write(tconn->rbio, raw, (int)raw_len);
         if (written <= 0)
-            return sh2_error_io;
+            return SH2_TLS_ERROR;
     }
 
     /* drive handshake if not complete */
-    if (!tconn->handshake_done) {
+    if (!tconn->handshake_complete) {
         int ret = SSL_do_handshake(tconn->ssl);
         if (ret == 1) {
-            tconn->handshake_done = true;
+            tconn->handshake_complete = true;
+            just_completed = true;
             extract_peer_cert(tconn);
             /* fall through to SSL_read for any buffered app data */
         } else {
             int err = SSL_get_error(tconn->ssl, ret);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
-                return sh2_ok; /* need more TCP data */
-            return sh2_error_io;
+                return SH2_TLS_NEED_MORE;
+            return SH2_TLS_ERROR;
         }
     }
 
@@ -358,21 +359,20 @@ sh2_result_t sh2_tls_feed(sh2_context_t *ctx, uint32_t conn_idx,
         int err = SSL_get_error(tconn->ssl, n);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_ZERO_RETURN)
             break;
-        return sh2_error_io;
+        return SH2_TLS_ERROR;
     }
     *out_len = total;
-    return sh2_ok;
+    return just_completed ? SH2_TLS_HANDSHAKE_DONE : SH2_TLS_DATA;
 }
 
 /* --------------------------------------------------------------------------
  * Encrypt plaintext → ciphertext
  * -------------------------------------------------------------------------- */
 
-sh2_result_t sh2_tls_encrypt(sh2_context_t *ctx, uint32_t conn_idx,
+sh2_result_t sh2_tls_encrypt(sh2_conn_t *conn,
                               const uint8_t *plain, uint32_t plain_len,
                               uint8_t **out_buf, uint32_t *out_len) {
-    (void)ctx;
-    sh2_tls_conn_t *tconn = ctx->conns[conn_idx].tls;
+    sh2_tls_conn_t *tconn = conn->tls;
     *out_buf = NULL;
     *out_len = 0;
 
@@ -400,9 +400,8 @@ sh2_result_t sh2_tls_encrypt(sh2_context_t *ctx, uint32_t conn_idx,
  * Drain wbio (handshake data, alerts)
  * -------------------------------------------------------------------------- */
 
-uint8_t *sh2_tls_drain_wbio(sh2_context_t *ctx, uint32_t conn_idx,
-                             uint32_t *out_len) {
-    sh2_tls_conn_t *tconn = ctx->conns[conn_idx].tls;
+uint8_t *sh2_tls_drain_wbio(sh2_conn_t *conn, uint32_t *out_len) {
+    sh2_tls_conn_t *tconn = conn->tls;
     *out_len = 0;
 
     int pending = (int)BIO_ctrl_pending(tconn->wbio);
@@ -545,7 +544,7 @@ void sh2_tls_client_cleanup(sh2_context_t *ctx) {
     }
 }
 
-sh2_result_t sh2_tls_client_conn_create(sh2_context_t *ctx, uint32_t conn_idx,
+sh2_result_t sh2_tls_client_conn_create(sh2_context_t *ctx, sh2_conn_t *conn,
                                          const char *hostname) {
     sh2_tls_conn_t *tconn = calloc(1, sizeof(*tconn));
     if (!tconn) return sh2_error_oom;
@@ -575,7 +574,7 @@ sh2_result_t sh2_tls_client_conn_create(sh2_context_t *ctx, uint32_t conn_idx,
     if (hostname && ctx->tls_client_config->verify_server)
         SSL_set1_host(tconn->ssl, hostname);
 
-    ctx->conns[conn_idx].tls = tconn;
+    conn->tls = tconn;
     return sh2_ok;
 }
 

@@ -88,7 +88,7 @@ shift-io accept → nghttp2 decode → request entity → request_out
                                                          │
                                         app processes request, builds response
                                                          │
-stream_result_out ← response_sending ← response_in ←──┘
+response_out ← response_sending ← response_in ←─────────┘
         │
    app destroys entity
 ```
@@ -96,26 +96,26 @@ stream_result_out ← response_sending ← response_in ←──┘
 ### Client data flow
 
 ```
-connect_out → shift-io connect → TLS handshake → nghttp2 client session
+connect_in → shift-io connect → TLS handshake → nghttp2 client session
                                                          │
-connect_result_out (session entity) ←────────────────────┘
+connect_out (session entity) ←───────────────────────────┘
         │
    app creates request with session
         │
-request_in → nghttp2 submit_request → response entity → response_out
-        │                                                     │
-   cancel_in ─→ RST_STREAM ──┐               stream_result_out (stream close)
-                              │                               │
-                              └───────────────────────────→ app destroys entity
+request_in → nghttp2 submit_request → response_out (response + stream close)
+        │                                    │
+   cancel_in ─→ RST_STREAM ─────────────→ app destroys entity
 
-connect_close_in ─→ GOAWAY ─→ drain in-flight streams ─→ connection closed
+disconnect_in ─→ GOAWAY ─→ drain in-flight streams ─→ connection closed
 ```
 
 ### Connection lifecycle
 
-States: `NEW → TLS_HANDSHAKE (if TLS) → ACTIVE → CLOSED`
+Connection state is represented by **collection membership** — user_conn entities move between internal collections as state changes:
 
-Direction (server vs client) is encoded as **collection membership**, not flags. Reads are triaged into direction-specific collections with separate processing functions:
+`sio_connection_results (NEW) → coll_conn_tls_handshake (if TLS) → coll_conn_active → coll_conn_draining → destroyed`
+
+Read entities are triaged into direction-specific collections with separate processing functions:
 
 | Collection | Direction | Purpose |
 |---|---|---|
@@ -150,7 +150,7 @@ shift_component_id_t all[] = {
     comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
     comp.domain_tag, comp.peer_cert,
 };
-shift_collection_id_t request_out, response_in, stream_result_out;
+shift_collection_id_t request_out, response_in, response_out;
 // ... register each with shift_collection_register() ...
 
 // 4. Create sh2 context
@@ -162,9 +162,9 @@ sh2_context_create(&(sh2_config_t){
     .ring_entries    = 32768,
     .buf_count       = 32768,
     .buf_size        = 65536,
-    .request_out         = request_out,
-    .response_in         = response_in,
-    .stream_result_out = stream_result_out,
+    .request_out     = request_out,
+    .response_in     = response_in,
+    .response_out    = response_out,
 }, &ctx);
 
 // 5. Listen (server)
@@ -176,13 +176,12 @@ sh2_context_create(&(sh2_config_t){
     // ... server fields as above ...
     .enable_connect = true,
     .client_colls = {
-        .connect_out        = connect_out,
-        .connect_result_out = connect_result_out,
-        .connect_close_in   = connect_close_in,
-        .request_in         = client_request_in,
-        .cancel_in          = client_cancel_in,
-        .response_out       = client_response_out,
-        .stream_result_out  = client_result_out,
+        .connect_in     = connect_in,
+        .connect_out    = connect_out,
+        .disconnect_in  = disconnect_in,
+        .request_in     = client_request_in,
+        .cancel_in      = client_cancel_in,
+        .response_out   = client_response_out,
     },
 }, &ctx);
 ```
@@ -221,7 +220,7 @@ while (running) {
     }
 
     // Drain completed responses
-    shift_collection_get_entities(sh, stream_result_out, &entities, &count);
+    shift_collection_get_entities(sh, response_out, &entities, &count);
     for (size_t i = 0; i < count; i++)
         shift_entity_destroy_one(sh, entities[i]);
 
@@ -234,7 +233,7 @@ while (running) {
 ```c
 // Create connect entity
 shift_entity_t ce;
-shift_entity_create_one_begin(sh, connect_out, &ce);
+shift_entity_create_one_begin(sh, connect_in, &ce);
 sh2_connect_target_t *tgt;
 shift_entity_get_component(sh, ce, comp.connect_target, (void **)&tgt);
 tgt->addr = (struct sockaddr_in){
@@ -246,7 +245,7 @@ tgt->hostname     = "example.com";
 tgt->hostname_len = 11;
 shift_entity_create_one_end(sh, ce);
 
-// In event loop: check connect_result_out for session entity,
+// In event loop: check connect_out for session entity,
 // then create request entity in request_in with:
 //   session (from connect result), req_headers (with pseudo-headers), req_body
 ```
@@ -255,25 +254,24 @@ shift_entity_create_one_end(sh, ce);
 
 ```c
 // Cancel an in-flight request — sh2 sends RST_STREAM.
-// Entity appears in stream_result_out with io_result.error = -1.
+// Entity appears in response_out with io_result.error = -1.
 shift_entity_move_one(sh, request_entity, cancel_in);
 
 // Graceful connection close — sh2 sends GOAWAY, drains in-flight
 // streams, then destroys the entity.
-shift_entity_move_one(sh, session_entity, connect_close_in);
+shift_entity_move_one(sh, session_entity, disconnect_in);
 ```
 
 Client collections:
 
 | Collection | Direction | Purpose |
 |---|---|---|
-| `connect_out` | → sh2 | Initiate outgoing connection |
-| `connect_result_out` | sh2 → | Connection established or failed |
-| `connect_close_in` | → sh2 | Graceful close (GOAWAY + drain) |
+| `connect_in` | → sh2 | Initiate outgoing connection |
+| `connect_out` | sh2 → | Connection established or failed |
+| `disconnect_in` | → sh2 | Graceful close (GOAWAY + drain) |
 | `request_in` | → sh2 | Submit request on a session |
 | `cancel_in` | → sh2 | Cancel in-flight stream (RST_STREAM) |
-| `response_out` | sh2 → | Completed response headers + body |
-| `stream_result_out` | sh2 → | Stream fully closed — app destroys entity |
+| `response_out` | sh2 → | Response received + stream close status |
 
 ### TLS configuration
 
