@@ -160,6 +160,18 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
     if (!cfg || !out || !cfg->shift) return sh2_error_null;
     if (cfg->client_only && !cfg->enable_connect) return sh2_error_invalid;
 
+    if (!cfg->client_only) {
+        if (!cfg->request_out || !cfg->response_in || !cfg->response_out)
+            return sh2_error_invalid;
+    }
+    if (cfg->enable_connect) {
+        const sh2_client_collection_ids_t *cc = &cfg->client_colls;
+        if (!cc->connect_in || !cc->connect_out || !cc->connect_errors ||
+            !cc->disconnect_in || !cc->request_in || !cc->cancel_in ||
+            !cc->response_out)
+            return sh2_error_invalid;
+    }
+
     sh2_context_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return sh2_error_oom;
 
