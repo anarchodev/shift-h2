@@ -8,6 +8,7 @@ HTTP/2 requests and responses are modeled as ECS entities with typed components,
 
 - **Server**: Accept HTTP/2 connections (cleartext h2c or TLS h2), receive requests, send responses
 - **Client**: Initiate outgoing HTTP/2 connections, send requests, receive responses, cancel in-flight streams, graceful connection close
+- **Client-only mode**: Create contexts without server collections — no listener, no server nghttp2 sessions, smaller footprint
 - **TLS**: ALPN h2 negotiation, SNI-based certificate selection with per-connection domain tags
 - **Mutual TLS**: Server-side client certificate verification; client-side certificate presentation; peer certificate identity available per-request for path-based authorization
 - **io_uring**: All I/O is async via io_uring provided buffers, including optional `IORING_SETUP_SQPOLL`
@@ -97,11 +98,13 @@ response_out ← response_sending ← response_in ←─────────
 
 ```
 connect_in → shift-io connect → TLS handshake → nghttp2 client session
+                │                                        │
+                │ (failure)                    (success)  │
+                ↓                                        ↓
+        connect_errors                           connect_out (session set)
                                                          │
-connect_out (session entity) ←───────────────────────────┘
-        │
-   app creates request with session
-        │
+                                    app creates request with session
+                                                         │
 request_in → nghttp2 submit_request → response_out (response + stream close)
         │                                    │
    cancel_in ─→ RST_STREAM ─────────────→ app destroys entity
@@ -170,19 +173,33 @@ sh2_context_create(&(sh2_config_t){
 // 5. Listen (server)
 sh2_listen(ctx, 9000, 4096);
 
-// — or enable client support —
+// — or enable client support (bidirectional: server + client) —
 // Register additional client collections, then:
 sh2_context_create(&(sh2_config_t){
     // ... server fields as above ...
     .enable_connect = true,
     .client_colls = {
-        .connect_in     = connect_in,
-        .connect_out    = connect_out,
-        .disconnect_in  = disconnect_in,
-        .request_in     = client_request_in,
-        .cancel_in      = client_cancel_in,
-        .response_out   = client_response_out,
+        .connect_in      = connect_in,
+        .connect_out     = connect_out,
+        .connect_errors  = connect_errors,
+        .disconnect_in   = disconnect_in,
+        .request_in      = client_request_in,
+        .cancel_in       = client_cancel_in,
+        .response_out    = client_response_out,
     },
+}, &ctx);
+
+// — or client-only (no server collections needed) —
+sh2_context_create(&(sh2_config_t){
+    .shift           = sh,
+    .comp_ids        = comp,
+    .max_connections = 64,
+    .ring_entries    = 256,
+    .buf_count       = 256,
+    .buf_size        = 65536,
+    .client_only     = true,
+    .enable_connect  = true,
+    .client_colls = { /* ... */ },
 }, &ctx);
 ```
 
@@ -266,8 +283,9 @@ Client collections:
 
 | Collection | Direction | Purpose |
 |---|---|---|
-| `connect_in` | → sh2 | Initiate outgoing connection |
-| `connect_out` | sh2 → | Connection established or failed |
+| `connect_in` | → sh2 | Initiate outgoing connection (same entity flows to connect_out or connect_errors) |
+| `connect_out` | sh2 → | Connection established — always success (same entity from connect_in) |
+| `connect_errors` | sh2 → | Connection failed — always error (same entity from connect_in) |
 | `disconnect_in` | → sh2 | Graceful close (GOAWAY + drain) |
 | `request_in` | → sh2 | Submit request on a session |
 | `cancel_in` | → sh2 | Cancel in-flight stream (RST_STREAM) |

@@ -45,6 +45,7 @@ typedef struct {
     /* client-side collections */
     shift_collection_id_t       connect_in;
     shift_collection_id_t       connect_out;
+    shift_collection_id_t       connect_errors;
     shift_collection_id_t       disconnect_in;
     shift_collection_id_t       client_request_in;
     shift_collection_id_t       client_cancel_in;
@@ -133,21 +134,24 @@ static void system_connect(proxy_t *p) {
     shift_collection_get_entities(p->sh, p->connect_out, &entities, &count);
 
     for (size_t i = 0; i < count; i++) {
+        sh2_session_t *sess = NULL;
+        shift_entity_get_component(p->sh, entities[i], p->comp.session,
+                                   (void **)&sess);
+        p->backend_session = sess->entity;
+        p->backend_connecting = false;
+        printf("Backend connected!\n");
+        shift_entity_destroy_one(p->sh, entities[i]);
+    }
+
+    /* drain connect errors */
+    shift_collection_get_entities(p->sh, p->connect_errors, &entities, &count);
+    for (size_t i = 0; i < count; i++) {
         sh2_io_result_t *io = NULL;
         shift_entity_get_component(p->sh, entities[i], p->comp.io_result,
                                    (void **)&io);
-        if (io && io->error == 0) {
-            sh2_session_t *sess = NULL;
-            shift_entity_get_component(p->sh, entities[i], p->comp.session,
-                                       (void **)&sess);
-            p->backend_session = sess->entity;
-            p->backend_connecting = false;
-            printf("Backend connected!\n");
-        } else {
-            fprintf(stderr, "Backend connect failed: %d\n",
-                    io ? io->error : -1);
-            p->backend_connecting = false;
-        }
+        fprintf(stderr, "Backend connect failed: %d\n",
+                io ? io->error : -1);
+        p->backend_connecting = false;
         shift_entity_destroy_one(p->sh, entities[i]);
     }
 }
@@ -404,8 +408,14 @@ int main(int argc, char **argv) {
     };
     const size_t proxy_comps_count = sizeof(proxy_comps) / sizeof(proxy_comps[0]);
 
-    shift_component_id_t connect_comps[] = {
+    shift_component_id_t connect_in_comps[] = {
         p.comp.connect_target, p.comp.session, p.comp.io_result,
+    };
+    shift_component_id_t connect_out_comps[] = {
+        p.comp.connect_target, p.comp.session,
+    };
+    shift_component_id_t connect_err_comps[] = {
+        p.comp.connect_target, p.comp.io_result,
     };
 
     {
@@ -415,9 +425,12 @@ int main(int argc, char **argv) {
             { .name = "response_out",         .comp_ids = sh2_comps,   .comp_count = sh2_comps_count },
             { .name = "pending",              .comp_ids = proxy_comps, .comp_count = proxy_comps_count },
             { .name = "inflight",             .comp_ids = proxy_comps, .comp_count = proxy_comps_count },
-            { .name = "connect_in",           .comp_ids = connect_comps,
-              .comp_count = sizeof(connect_comps) / sizeof(connect_comps[0]) },
-            { .name = "connect_out",          .comp_ids = sh2_comps,   .comp_count = sh2_comps_count },
+            { .name = "connect_in",           .comp_ids = connect_in_comps,
+              .comp_count = sizeof(connect_in_comps) / sizeof(connect_in_comps[0]) },
+            { .name = "connect_out",          .comp_ids = connect_out_comps,
+              .comp_count = sizeof(connect_out_comps) / sizeof(connect_out_comps[0]) },
+            { .name = "connect_errors",       .comp_ids = connect_err_comps,
+              .comp_count = sizeof(connect_err_comps) / sizeof(connect_err_comps[0]) },
             { .name = "disconnect_in",        .comp_ids = sh2_comps,   .comp_count = sh2_comps_count },
             { .name = "client_request_in",    .comp_ids = sh2_comps,   .comp_count = sh2_comps_count },
             { .name = "client_cancel_in",     .comp_ids = sh2_comps,   .comp_count = sh2_comps_count },
@@ -426,10 +439,10 @@ int main(int argc, char **argv) {
         shift_collection_id_t *ids[] = {
             &p.request_out, &p.response_in, &p.response_out,
             &p.pending, &p.inflight,
-            &p.connect_in, &p.connect_out, &p.disconnect_in,
+            &p.connect_in, &p.connect_out, &p.connect_errors, &p.disconnect_in,
             &p.client_request_in, &p.client_cancel_in, &p.client_response_out,
         };
-        for (int c = 0; c < 11; c++) {
+        for (int c = 0; c < 12; c++) {
             if (shift_collection_register(p.sh, &colls[c], ids[c]) != shift_ok) {
                 fprintf(stderr, "failed to register collection: %s\n",
                         colls[c].name);
@@ -455,6 +468,7 @@ int main(int argc, char **argv) {
         .client_colls = {
             .connect_in      = p.connect_in,
             .connect_out     = p.connect_out,
+            .connect_errors  = p.connect_errors,
             .disconnect_in   = p.disconnect_in,
             .request_in      = p.client_request_in,
             .cancel_in       = p.client_cancel_in,

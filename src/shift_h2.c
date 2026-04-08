@@ -158,16 +158,20 @@ sh2_result_t sh2_register_components(shift_t *sh, sh2_component_ids_t *out) {
 
 sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
     if (!cfg || !out || !cfg->shift) return sh2_error_null;
+    if (cfg->client_only && !cfg->enable_connect) return sh2_error_invalid;
 
     sh2_context_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return sh2_error_oom;
 
-    ctx->shift    = cfg->shift;
-    ctx->comp_ids = cfg->comp_ids;
+    ctx->shift      = cfg->shift;
+    ctx->comp_ids   = cfg->comp_ids;
+    ctx->client_only = cfg->client_only;
 
-    ctx->coll_ids.request_out         = cfg->request_out;
-    ctx->coll_ids.response_in         = cfg->response_in;
-    ctx->coll_ids.response_out = cfg->response_out;
+    if (!cfg->client_only) {
+        ctx->coll_ids.request_out  = cfg->request_out;
+        ctx->coll_ids.response_in  = cfg->response_in;
+        ctx->coll_ids.response_out = cfg->response_out;
+    }
 
     /* register sio components */
     if (sio_register_components(ctx->shift, &ctx->sio_comp_ids) != sio_ok) {
@@ -201,21 +205,38 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         }
     }
 
-    /* create sio result collections — connection_results now carries
-     * the internal_conn component so sio's connections collection
-     * (via superset) also has it. */
+    /* register internal connect entity handle component — carries a reference
+     * to the user's original connect_in entity through sio's pipeline */
+    {
+        shift_component_info_t ci = {
+            .element_size = sizeof(sh2_connect_entity_t),
+        };
+        if (shift_component_register(ctx->shift, &ci,
+                                      &ctx->internal_connect_entity) != shift_ok) {
+            free(ctx);
+            return sh2_error_invalid;
+        }
+    }
+
+    /* create sio collections — connections carries internal_conn so
+     * sh2_conn_t lives on the connection entity itself.
+     * internal_hostname and internal_connect_entity are included so
+     * they survive sio's connect pipeline (superset of connections). */
     {
         shift_component_id_t comps[] = {
-            ctx->sio_comp_ids.conn_entity,
+            ctx->sio_comp_ids.fd,
+            ctx->sio_comp_ids.read_cycle_entity,
             ctx->internal_conn,
+            ctx->internal_hostname,
+            ctx->internal_connect_entity,
         };
         shift_collection_info_t ci = {
-            .name       = "sio_connection_results",
+            .name       = "sio_connections",
             .comp_ids   = comps,
             .comp_count = sizeof(comps) / sizeof(comps[0]),
         };
         if (shift_collection_register(ctx->shift, &ci,
-                                      &ctx->sio_connection_results) != shift_ok) {
+                                      &ctx->sio_connections) != shift_ok) {
             free(ctx);
             return sh2_error_invalid;
         }
@@ -225,7 +246,6 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             ctx->sio_comp_ids.read_buf,
             ctx->sio_comp_ids.io_result,
             ctx->sio_comp_ids.conn_entity,
-            ctx->sio_comp_ids.user_conn_entity,
         };
         shift_collection_info_t ci = {
             .name       = "sio_read_results",
@@ -243,7 +263,6 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             ctx->sio_comp_ids.write_buf,
             ctx->sio_comp_ids.io_result,
             ctx->sio_comp_ids.conn_entity,
-            ctx->sio_comp_ids.user_conn_entity,
         };
         shift_collection_info_t ci = {
             .name       = "sio_write_results",
@@ -257,26 +276,74 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         }
     }
 
-    /* sio connect_results collection (if outgoing connections enabled) */
+    /* client / outgoing connection support */
     ctx->enable_connect = cfg->enable_connect;
     if (cfg->enable_connect) {
         ctx->coll_ids_client = cfg->client_colls;
 
-        shift_component_id_t comps[] = {
-            ctx->sio_comp_ids.io_result,
-            ctx->sio_comp_ids.conn_entity,
-            ctx->sio_comp_ids.user_conn_entity,
-            ctx->internal_hostname,
-        };
-        shift_collection_info_t ci = {
-            .name       = "sio_connect_results",
-            .comp_ids   = comps,
-            .comp_count = sizeof(comps) / sizeof(comps[0]),
-        };
-        if (shift_collection_register(ctx->shift, &ci,
-                                      &ctx->sio_connect_results) != shift_ok) {
-            free(ctx);
-            return sh2_error_invalid;
+        /* sio connect_errors: failed connects land here */
+        {
+            shift_component_id_t comps[] = {
+                ctx->sio_comp_ids.io_result,
+                ctx->sio_comp_ids.connect_addr,
+                ctx->internal_hostname,
+                ctx->internal_connect_entity,
+            };
+            shift_collection_info_t ci = {
+                .name       = "sio_connect_errors",
+                .comp_ids   = comps,
+                .comp_count = sizeof(comps) / sizeof(comps[0]),
+            };
+            if (shift_collection_register(ctx->shift, &ci,
+                                          &ctx->sio_connect_errors) != shift_ok) {
+                free(ctx);
+                return sh2_error_invalid;
+            }
+        }
+
+        /* connect_pending: union of connect_in + connect_out + connect_errors
+         * components. User entities park here during sio's TCP connect
+         * round-trip, then move to connect_out or connect_errors. */
+        {
+            const shift_component_id_t *cin_comps = NULL, *cout_comps = NULL,
+                                       *cerr_comps = NULL;
+            uint32_t cin_count = 0, cout_count = 0, cerr_count = 0;
+            if (shift_collection_get_components(ctx->shift,
+                    cfg->client_colls.connect_in,
+                    &cin_comps, &cin_count) != shift_ok ||
+                shift_collection_get_components(ctx->shift,
+                    cfg->client_colls.connect_out,
+                    &cout_comps, &cout_count) != shift_ok ||
+                shift_collection_get_components(ctx->shift,
+                    cfg->client_colls.connect_errors,
+                    &cerr_comps, &cerr_count) != shift_ok) {
+                free(ctx);
+                return sh2_error_invalid;
+            }
+            /* merge + deduplicate all three */
+            shift_component_id_t merged[64];
+            uint32_t merged_count = 0;
+            const shift_component_id_t *lists[] = { cin_comps, cout_comps, cerr_comps };
+            uint32_t counts[] = { cin_count, cout_count, cerr_count };
+            for (int l = 0; l < 3; l++) {
+                for (uint32_t j = 0; j < counts[l] && merged_count < 64; j++) {
+                    bool dup = false;
+                    for (uint32_t k = 0; k < merged_count; k++) {
+                        if (lists[l][j] == merged[k]) { dup = true; break; }
+                    }
+                    if (!dup) merged[merged_count++] = lists[l][j];
+                }
+            }
+            shift_collection_info_t ci_cp = {
+                .name       = "connect_pending",
+                .comp_ids   = merged,
+                .comp_count = merged_count,
+            };
+            if (shift_collection_register(ctx->shift, &ci_cp,
+                                          &ctx->coll_connect_pending) != shift_ok) {
+                free(ctx);
+                return sh2_error_invalid;
+            }
         }
     }
 
@@ -289,13 +356,12 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             .buf_size           = cfg->buf_size,
             .max_connections    = cfg->max_connections,
             .ring_entries       = cfg->ring_entries,
-            .connection_results = ctx->sio_connection_results,
+            .connections        = ctx->sio_connections,
             .read_results       = ctx->sio_read_results,
             .write_results      = ctx->sio_write_results,
-            .auto_destroy_user_entity = false,
             .ring_params        = cfg->ring_params,
             .enable_connect     = cfg->enable_connect,
-            .connect_results    = ctx->sio_connect_results,
+            .connect_errors     = ctx->sio_connect_errors,
         };
         if (sio_context_create(&sio_cfg, &ctx->sio) != sio_ok) {
             free(ctx);
@@ -303,11 +369,11 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         }
     }
 
-    /* internal collection: response_sending
+    /* internal collection: response_sending (server path only)
      * Mirror response_in's component list so user-added components
      * survive the response_in → response_sending → response_out
      * pipeline without being destructed. */
-    {
+    if (!cfg->client_only) {
         const shift_component_id_t *resp_comps = NULL;
         uint32_t resp_comp_count = 0;
         if (shift_collection_get_components(ctx->shift,
@@ -330,10 +396,11 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         }
     }
 
-    /* connection state collections (same archetype as sio_connection_results) */
+    /* connection state collections (same archetype as sio_connections) */
     {
         shift_component_id_t comps[] = {
-            ctx->sio_comp_ids.conn_entity,
+            ctx->sio_comp_ids.fd,
+            ctx->sio_comp_ids.read_cycle_entity,
             ctx->internal_conn,
         };
         uint32_t ncomps = sizeof(comps) / sizeof(comps[0]);
@@ -360,7 +427,6 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             ctx->sio_comp_ids.read_buf,
             ctx->sio_comp_ids.io_result,
             ctx->sio_comp_ids.conn_entity,
-            ctx->sio_comp_ids.user_conn_entity,
         };
         shift_collection_info_t ci_err  = { .name = "read_errors",  .comp_ids = comps,
                                             .comp_count = sizeof(comps) / sizeof(comps[0]) };
@@ -382,12 +448,15 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
 
     ctx->max_connections = cfg->max_connections;
 
-    /* nghttp2 server callbacks */
-    sh2_result_t r = sh2_nghttp2_init_callbacks(ctx);
-    if (r != sh2_ok) {
-        sio_context_destroy(ctx->sio);
-        free(ctx);
-        return r;
+    /* nghttp2 server callbacks (not needed in client-only mode) */
+    sh2_result_t r = sh2_ok;
+    if (!cfg->client_only) {
+        r = sh2_nghttp2_init_callbacks(ctx);
+        if (r != sh2_ok) {
+            sio_context_destroy(ctx->sio);
+            free(ctx);
+            return r;
+        }
     }
 
     /* client-path setup (if outgoing connections enabled) */
@@ -429,7 +498,6 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
                 ctx->sio_comp_ids.read_buf,
                 ctx->sio_comp_ids.io_result,
                 ctx->sio_comp_ids.conn_entity,
-                ctx->sio_comp_ids.user_conn_entity,
             };
             shift_collection_info_t ci_init = { .name = "read_client_init",
                                                 .comp_ids = comps,
@@ -459,7 +527,6 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             ctx->sio_comp_ids.read_buf,
             ctx->sio_comp_ids.io_result,
             ctx->sio_comp_ids.conn_entity,
-            ctx->sio_comp_ids.user_conn_entity,
         };
         shift_collection_info_t ci = {
             .name       = "read_tls_handshake",
@@ -532,7 +599,7 @@ void sh2_context_destroy(sh2_context_t *ctx) {
     }
 
     shift_flush(ctx->shift);
-    {
+    if (!ctx->client_only) {
         shift_entity_t *entities = NULL;
         size_t          count    = 0;
         shift_collection_get_entities(ctx->shift, ctx->coll_response_sending,
@@ -549,6 +616,12 @@ void sh2_context_destroy(sh2_context_t *ctx) {
                                       &entities, &count);
         for (size_t i = 0; i < count; i++)
             shift_entity_destroy_one(ctx->shift, entities[i]);
+
+        shift_collection_get_entities(ctx->shift, ctx->coll_connect_pending,
+                                      &entities, &count);
+        for (size_t i = 0; i < count; i++)
+            shift_entity_destroy_one(ctx->shift, entities[i]);
+
         shift_flush(ctx->shift);
     }
 
@@ -573,6 +646,7 @@ void sh2_context_destroy(sh2_context_t *ctx) {
 
 sh2_result_t sh2_listen(sh2_context_t *ctx, uint16_t port, int backlog) {
     if (!ctx) return sh2_error_null;
+    if (ctx->client_only) return sh2_error_invalid;
     return sio_listen(ctx->sio, port, backlog) == sio_ok
         ? sh2_ok : sh2_error_io;
 }
@@ -586,7 +660,7 @@ const sh2_component_ids_t *sh2_get_component_ids(const sh2_context_t *ctx) {
 }
 
 const sh2_collection_ids_t *sh2_get_collection_ids(const sh2_context_t *ctx) {
-    return ctx ? &ctx->coll_ids : NULL;
+    return (ctx && !ctx->client_only) ? &ctx->coll_ids : NULL;
 }
 
 const sh2_client_collection_ids_t *sh2_get_client_collection_ids(const sh2_context_t *ctx) {

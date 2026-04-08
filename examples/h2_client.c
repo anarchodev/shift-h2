@@ -109,30 +109,26 @@ int main(int argc, char **argv) {
         comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
         comp.domain_tag, comp.peer_cert,
     };
-    shift_collection_id_t request_out, response_in, response_out;
-    {
-        shift_collection_info_t ci  = { .name = "request_out",         .comp_ids = all_comps,
-                                        .comp_count = sizeof(all_comps)/sizeof(all_comps[0]) };
-        shift_collection_info_t ci2 = { .name = "response_in",         .comp_ids = all_comps,
-                                        .comp_count = sizeof(all_comps)/sizeof(all_comps[0]) };
-        shift_collection_info_t ci3 = { .name = "response_out",      .comp_ids = all_comps,
-                                        .comp_count = sizeof(all_comps)/sizeof(all_comps[0]) };
-        shift_collection_register(sh, &ci, &request_out);
-        shift_collection_register(sh, &ci2, &response_in);
-        shift_collection_register(sh, &ci3, &response_out);
-    }
 
-    shift_component_id_t connect_comps[] = {
+    shift_component_id_t connect_in_comps[] = {
         comp.connect_target, comp.session, comp.io_result,
     };
-    shift_collection_id_t connect_in, connect_out, disconnect_in;
+    shift_component_id_t connect_out_comps[] = {
+        comp.connect_target, comp.session,
+    };
+    shift_component_id_t connect_err_comps[] = {
+        comp.connect_target, comp.io_result,
+    };
+    shift_collection_id_t connect_in, connect_out, connect_errors, disconnect_in;
     shift_collection_id_t client_request_in, client_cancel_in;
     shift_collection_id_t client_response_out;
     {
-        shift_collection_info_t ci_co = { .name = "connect_in", .comp_ids = connect_comps,
-                                          .comp_count = sizeof(connect_comps)/sizeof(connect_comps[0]) };
-        shift_collection_info_t ci_cr = { .name = "connect_out", .comp_ids = all_comps,
-                                          .comp_count = sizeof(all_comps)/sizeof(all_comps[0]) };
+        shift_collection_info_t ci_co = { .name = "connect_in", .comp_ids = connect_in_comps,
+                                          .comp_count = sizeof(connect_in_comps)/sizeof(connect_in_comps[0]) };
+        shift_collection_info_t ci_cr = { .name = "connect_out", .comp_ids = connect_out_comps,
+                                          .comp_count = sizeof(connect_out_comps)/sizeof(connect_out_comps[0]) };
+        shift_collection_info_t ci_ce = { .name = "connect_errors", .comp_ids = connect_err_comps,
+                                          .comp_count = sizeof(connect_err_comps)/sizeof(connect_err_comps[0]) };
         shift_collection_info_t ci_cc = { .name = "disconnect_in", .comp_ids = all_comps,
                                           .comp_count = sizeof(all_comps)/sizeof(all_comps[0]) };
         shift_collection_info_t ci_ri = { .name = "client_request_in", .comp_ids = all_comps,
@@ -143,6 +139,7 @@ int main(int argc, char **argv) {
                                           .comp_count = sizeof(all_comps)/sizeof(all_comps[0]) };
         shift_collection_register(sh, &ci_co, &connect_in);
         shift_collection_register(sh, &ci_cr, &connect_out);
+        shift_collection_register(sh, &ci_ce, &connect_errors);
         shift_collection_register(sh, &ci_cc, &disconnect_in);
         shift_collection_register(sh, &ci_ri, &client_request_in);
         shift_collection_register(sh, &ci_ci, &client_cancel_in);
@@ -157,13 +154,12 @@ int main(int argc, char **argv) {
         .ring_entries        = RING_ENTRIES,
         .buf_count           = BUF_COUNT,
         .buf_size            = BUF_SIZE,
-        .request_out         = request_out,
-        .response_in         = response_in,
-        .response_out      = response_out,
+        .client_only         = true,
         .enable_connect      = true,
         .client_colls = {
             .connect_in          = connect_in,
             .connect_out         = connect_out,
+            .connect_errors      = connect_errors,
             .disconnect_in       = disconnect_in,
             .request_in          = client_request_in,
             .cancel_in           = client_cancel_in,
@@ -215,44 +211,48 @@ int main(int argc, char **argv) {
             shift_collection_get_entities(sh, connect_out,
                                           &entities, &count);
             for (size_t i = 0; i < count; i++) {
+                printf("TLS connection established!\n");
+                connected = true;
+
+                sh2_session_t *sess = NULL;
+                shift_entity_get_component(sh, entities[i], comp.session,
+                                           (void **)&sess);
+
+                shift_entity_t re;
+                shift_entity_create_one_begin(sh, client_request_in, &re);
+
+                sh2_session_t *rsess = NULL;
+                shift_entity_get_component(sh, re, comp.session,
+                                           (void **)&rsess);
+                rsess->entity = sess->entity;
+
+                sh2_req_headers_t *rh = NULL;
+                shift_entity_get_component(sh, re, comp.req_headers,
+                                           (void **)&rh);
+                sh2_header_field_t *fields = calloc(4, sizeof(sh2_header_field_t));
+                fields[0] = (sh2_header_field_t){ ":method",    7, "GET", 3 };
+                fields[1] = (sh2_header_field_t){ ":path",      5, path, (uint32_t)strlen(path) };
+                fields[2] = (sh2_header_field_t){ ":scheme",    7, "https", 5 };
+                fields[3] = (sh2_header_field_t){ ":authority", 10, host, (uint32_t)strlen(host) };
+                rh->fields = fields;
+                rh->count  = 4;
+
+                shift_entity_create_one_end(sh, re);
+                request_sent = true;
+                printf("Sent GET %s\n", path);
+                shift_entity_destroy_one(sh, entities[i]);
+            }
+
+            /* check connect_errors */
+            shift_collection_get_entities(sh, connect_errors,
+                                          &entities, &count);
+            for (size_t i = 0; i < count; i++) {
                 sh2_io_result_t *io = NULL;
                 shift_entity_get_component(sh, entities[i], comp.io_result,
                                            (void **)&io);
-                if (io && io->error == 0) {
-                    printf("TLS connection established!\n");
-                    connected = true;
-
-                    sh2_session_t *sess = NULL;
-                    shift_entity_get_component(sh, entities[i], comp.session,
-                                               (void **)&sess);
-
-                    shift_entity_t re;
-                    shift_entity_create_one_begin(sh, client_request_in, &re);
-
-                    sh2_session_t *rsess = NULL;
-                    shift_entity_get_component(sh, re, comp.session,
-                                               (void **)&rsess);
-                    rsess->entity = sess->entity;
-
-                    sh2_req_headers_t *rh = NULL;
-                    shift_entity_get_component(sh, re, comp.req_headers,
-                                               (void **)&rh);
-                    sh2_header_field_t *fields = calloc(4, sizeof(sh2_header_field_t));
-                    fields[0] = (sh2_header_field_t){ ":method",    7, "GET", 3 };
-                    fields[1] = (sh2_header_field_t){ ":path",      5, path, (uint32_t)strlen(path) };
-                    fields[2] = (sh2_header_field_t){ ":scheme",    7, "https", 5 };
-                    fields[3] = (sh2_header_field_t){ ":authority", 10, host, (uint32_t)strlen(host) };
-                    rh->fields = fields;
-                    rh->count  = 4;
-
-                    shift_entity_create_one_end(sh, re);
-                    request_sent = true;
-                    printf("Sent GET %s\n", path);
-                } else {
-                    fprintf(stderr, "Connect failed: %d\n", io ? io->error : -1);
-                    response_done = true;
-                }
+                fprintf(stderr, "Connect failed: %d\n", io ? io->error : -1);
                 shift_entity_destroy_one(sh, entities[i]);
+                response_done = true;
             }
         }
 

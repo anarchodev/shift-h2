@@ -18,7 +18,7 @@ void sh2_reads_triage(sh2_context_t *ctx) {
   shift_entity_t *entities = NULL;
   sio_read_buf_t *rbufs = NULL;
   sio_io_result_t *results = NULL;
-  sio_user_conn_entity_t *uconns = NULL;
+  sio_conn_entity_t *conns = NULL;
   size_t count = 0;
 
   shift_collection_get_entities(sh, ctx->sio_read_results, &entities, &count);
@@ -32,15 +32,15 @@ void sh2_reads_triage(sh2_context_t *ctx) {
                                        ctx->sio_comp_ids.io_result,
                                        (void **)&results, NULL);
   shift_collection_get_component_array(sh, ctx->sio_read_results,
-                                       ctx->sio_comp_ids.user_conn_entity,
-                                       (void **)&uconns, NULL);
+                                       ctx->sio_comp_ids.conn_entity,
+                                       (void **)&conns, NULL);
 
   for (size_t i = 0; i < count; i++) {
-    shift_entity_t user_conn = uconns[i].entity;
+    shift_entity_t conn_ent = conns[i].entity;
 
     /* connection already torn down */
-    if (shift_entity_is_stale(sh, user_conn) ||
-        shift_entity_is_moving(sh, user_conn)) {
+    if (shift_entity_is_stale(sh, conn_ent) ||
+        shift_entity_is_moving(sh, conn_ent)) {
       SH2_CHECK(shift_entity_move_one(sh, entities[i], ctx->coll_read_errors),
                 "triage: stale → errors");
       continue;
@@ -48,7 +48,7 @@ void sh2_reads_triage(sh2_context_t *ctx) {
 
     /* determine connection state via collection membership */
     shift_collection_id_t conn_coll = 0;
-    if (shift_entity_get_collection(sh, user_conn, &conn_coll) != shift_ok) {
+    if (shift_entity_get_collection(sh, conn_ent, &conn_coll) != shift_ok) {
       SH2_CHECK(shift_entity_move_one(sh, entities[i], ctx->coll_read_errors),
                 "triage: no collection → errors");
       continue;
@@ -62,9 +62,9 @@ void sh2_reads_triage(sh2_context_t *ctx) {
       continue;
     }
 
-    /* new connection needing init — still in sio_connection_results */
-    if (conn_coll == ctx->sio_connection_results) {
-      sh2_conn_t *conn = sh2_conn_get(ctx, user_conn);
+    /* new connection needing init — still in sio_connections */
+    if (conn_coll == ctx->sio_connections) {
+      sh2_conn_t *conn = sh2_conn_get(ctx, conn_ent);
       shift_collection_id_t dest = (conn && conn->direction == SH2_DIR_CLIENT)
           ? ctx->coll_read_client_init : ctx->coll_read_init;
       SH2_CHECK(shift_entity_move_one(sh, entities[i], dest),
@@ -75,7 +75,7 @@ void sh2_reads_triage(sh2_context_t *ctx) {
 #ifdef SH2_HAS_TLS
     /* TLS handshake in progress */
     if (conn_coll == ctx->coll_conn_tls_handshake) {
-      sh2_conn_t *conn = sh2_conn_get(ctx, user_conn);
+      sh2_conn_t *conn = sh2_conn_get(ctx, conn_ent);
       shift_collection_id_t dest = (conn && conn->direction == SH2_DIR_CLIENT)
           ? ctx->coll_read_client_handshake : ctx->coll_read_handshake;
       SH2_CHECK(shift_entity_move_one(sh, entities[i], dest),
@@ -106,7 +106,6 @@ void sh2_reads_handle_errors(sh2_context_t *ctx) {
   shift_entity_t *entities = NULL;
   sio_io_result_t *results = NULL;
   sio_conn_entity_t *conns = NULL;
-  sio_user_conn_entity_t *uconns = NULL;
   size_t count = 0;
 
   shift_collection_get_entities(sh, ctx->coll_read_errors, &entities, &count);
@@ -119,32 +118,25 @@ void sh2_reads_handle_errors(sh2_context_t *ctx) {
   shift_collection_get_component_array(sh, ctx->coll_read_errors,
                                        ctx->sio_comp_ids.conn_entity,
                                        (void **)&conns, NULL);
-  shift_collection_get_component_array(sh, ctx->coll_read_errors,
-                                       ctx->sio_comp_ids.user_conn_entity,
-                                       (void **)&uconns, NULL);
 
   for (size_t i = 0; i < count; i++) {
-    shift_entity_t user_conn = uconns[i].entity;
+    shift_entity_t conn_ent = conns[i].entity;
 
-    if (!shift_entity_is_stale(sh, user_conn) &&
-        !shift_entity_is_moving(sh, user_conn)) {
+    if (!shift_entity_is_stale(sh, conn_ent) &&
+        !shift_entity_is_moving(sh, conn_ent)) {
       shift_collection_id_t conn_coll = 0;
-      shift_entity_get_collection(sh, user_conn, &conn_coll);
+      shift_entity_get_collection(sh, conn_ent, &conn_coll);
 
       if (conn_coll == ctx->coll_conn_active
 #ifdef SH2_HAS_TLS
           || conn_coll == ctx->coll_conn_tls_handshake
 #endif
          ) {
-        sh2_conn_close(ctx, user_conn);
-      } else if (conn_coll == ctx->sio_connection_results) {
-        /* NEW connection — destroy both entities */
-        if (!shift_entity_is_stale(sh, conns[i].entity))
-          SH2_CHECK(shift_entity_destroy_one(sh, conns[i].entity),
-                    "destroy conn_entity (error new)");
-        if (!shift_entity_is_stale(sh, user_conn))
-          SH2_CHECK(shift_entity_destroy_one(sh, user_conn),
-                    "destroy user_conn (error new)");
+        sh2_conn_close(ctx, conn_ent);
+      } else if (conn_coll == ctx->sio_connections) {
+        /* NEW connection — destroy it */
+        SH2_CHECK(shift_entity_destroy_one(sh, conn_ent),
+                  "destroy conn_entity (error new)");
       }
     }
 
@@ -158,11 +150,12 @@ void sh2_reads_handle_errors(sh2_context_t *ctx) {
  * -------------------------------------------------------------------------- */
 
 void sh2_reads_init_connections(sh2_context_t *ctx) {
+  if (ctx->client_only) return;
+
   shift_t *sh = ctx->shift;
 
   shift_entity_t *entities = NULL;
   sio_conn_entity_t *conns = NULL;
-  sio_user_conn_entity_t *uconns = NULL;
   size_t count = 0;
 
   shift_collection_get_entities(sh, ctx->coll_read_init, &entities, &count);
@@ -172,36 +165,27 @@ void sh2_reads_init_connections(sh2_context_t *ctx) {
   shift_collection_get_component_array(sh, ctx->coll_read_init,
                                        ctx->sio_comp_ids.conn_entity,
                                        (void **)&conns, NULL);
-  shift_collection_get_component_array(sh, ctx->coll_read_init,
-                                       ctx->sio_comp_ids.user_conn_entity,
-                                       (void **)&uconns, NULL);
 
   for (size_t i = 0; i < count; i++) {
-    shift_entity_t user_conn = uconns[i].entity;
+    shift_entity_t conn_ent = conns[i].entity;
 
-    sh2_conn_t *conn = sh2_conn_get(ctx, user_conn);
+    sh2_conn_t *conn = sh2_conn_get(ctx, conn_ent);
     if (!conn) {
-      SH2_CHECK(shift_entity_destroy_one(sh, conns[i].entity),
+      SH2_CHECK(shift_entity_destroy_one(sh, conn_ent),
                 "destroy conn_entity (no conn)");
-      SH2_CHECK(shift_entity_destroy_one(sh, user_conn),
-                "destroy user_conn (no conn)");
       SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
                 "destroy read entity (no conn)");
       continue;
     }
 
-    /* Initialize connection state on the component */
-    conn->conn_entity = conns[i].entity;
     conn->last_active_ns = sh2_monotonic_ns();
 
 #ifdef SH2_HAS_TLS
     if (ctx->tls_config) {
       /* TLS mode: create SSL object, start handshake */
       if (sh2_tls_conn_create(ctx, conn) != sh2_ok) {
-        SH2_CHECK(shift_entity_destroy_one(sh, conns[i].entity),
+        SH2_CHECK(shift_entity_destroy_one(sh, conn_ent),
                   "destroy conn_entity (tls fail)");
-        SH2_CHECK(shift_entity_destroy_one(sh, user_conn),
-                  "destroy user_conn (tls fail)");
         SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
                   "destroy read entity (tls fail)");
         continue;
@@ -212,11 +196,9 @@ void sh2_reads_init_connections(sh2_context_t *ctx) {
 #endif
     {
       /* h2c mode: create nghttp2 session directly */
-      if (sh2_nghttp2_session_create(ctx, user_conn) != sh2_ok) {
-        SH2_CHECK(shift_entity_destroy_one(sh, conns[i].entity),
+      if (sh2_nghttp2_session_create(ctx, conn_ent) != sh2_ok) {
+        SH2_CHECK(shift_entity_destroy_one(sh, conn_ent),
                   "destroy conn_entity (session fail)");
-        SH2_CHECK(shift_entity_destroy_one(sh, user_conn),
-                  "destroy user_conn (session fail)");
         SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
                   "destroy read entity (session fail)");
         continue;
@@ -237,7 +219,7 @@ void sh2_reads_init_connections(sh2_context_t *ctx) {
 sh2_hs_step_t sh2_tls_handshake_step(
     sh2_context_t *ctx,
     shift_entity_t read_entity,
-    shift_entity_t user_conn,
+    shift_entity_t conn_ent,
     const uint8_t *raw_data, uint32_t raw_len,
     uint8_t *decrypt_buf, uint32_t decrypt_cap, uint32_t *decrypt_len) {
 
@@ -245,14 +227,14 @@ sh2_hs_step_t sh2_tls_handshake_step(
   const sio_collection_ids_t *sio_colls = sio_get_collection_ids(ctx->sio);
 
   /* connection already torn down */
-  if (shift_entity_is_stale(sh, user_conn) ||
-      shift_entity_is_moving(sh, user_conn)) {
+  if (shift_entity_is_stale(sh, conn_ent) ||
+      shift_entity_is_moving(sh, conn_ent)) {
     SH2_CHECK(shift_entity_destroy_one(sh, read_entity),
               "destroy read entity (handshake stale)");
     return SH2_HS_HANDLED;
   }
 
-  sh2_conn_t *conn = sh2_conn_get(ctx, user_conn);
+  sh2_conn_t *conn = sh2_conn_get(ctx, conn_ent);
   if (!conn || !conn->tls) {
     SH2_CHECK(shift_entity_destroy_one(sh, read_entity),
               "destroy read entity (no tls)");
@@ -285,20 +267,14 @@ sh2_hs_step_t sh2_tls_handshake_step(
     SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.conn_entity,
                                           (void **)&ce),
               "get conn_entity (handshake write)");
-    ce->entity = conn->conn_entity;
-
-    sio_user_conn_entity_t *uce = NULL;
-    SH2_CHECK(shift_entity_get_component(sh, we, ctx->sio_comp_ids.user_conn_entity,
-                                          (void **)&uce),
-              "get user_conn_entity (handshake write)");
-    uce->entity = user_conn;
+    ce->entity = conn_ent;
 
     SH2_CHECK(shift_entity_create_one_end(sh, we), "create_end write entity (handshake)");
     conn->pending_writes++;
   }
 
   if (r == SH2_TLS_ERROR) {
-    sh2_conn_close(ctx, user_conn);
+    sh2_conn_close(ctx, conn_ent);
     SH2_CHECK(shift_entity_destroy_one(sh, read_entity),
               "destroy read entity (handshake fail)");
     return SH2_HS_HANDLED;
@@ -310,7 +286,7 @@ sh2_hs_step_t sh2_tls_handshake_step(
     unsigned int alpn_len = 0;
     SSL_get0_alpn_selected(conn->tls->ssl, &alpn, &alpn_len);
     if (alpn_len != 2 || alpn[0] != 'h' || alpn[1] != '2') {
-      sh2_conn_close(ctx, user_conn);
+      sh2_conn_close(ctx, conn_ent);
       SH2_CHECK(shift_entity_destroy_one(sh, read_entity),
                 "destroy read entity (no alpn h2)");
       return SH2_HS_HANDLED;
@@ -335,7 +311,7 @@ void sh2_reads_tls_handshake(sh2_context_t *ctx) {
 
   shift_entity_t *entities = NULL;
   sio_read_buf_t *rbufs = NULL;
-  sio_user_conn_entity_t *uconns = NULL;
+  sio_conn_entity_t *conns = NULL;
   size_t count = 0;
 
   shift_collection_get_entities(sh, ctx->coll_read_handshake, &entities, &count);
@@ -346,16 +322,16 @@ void sh2_reads_tls_handshake(sh2_context_t *ctx) {
                                        ctx->sio_comp_ids.read_buf,
                                        (void **)&rbufs, NULL);
   shift_collection_get_component_array(sh, ctx->coll_read_handshake,
-                                       ctx->sio_comp_ids.user_conn_entity,
-                                       (void **)&uconns, NULL);
+                                       ctx->sio_comp_ids.conn_entity,
+                                       (void **)&conns, NULL);
 
   for (size_t i = 0; i < count; i++) {
-    shift_entity_t user_conn = uconns[i].entity;
+    shift_entity_t conn_ent = conns[i].entity;
     uint8_t decrypt_buf[65536];
     uint32_t decrypt_len = 0;
 
     sh2_hs_step_t step = sh2_tls_handshake_step(
-        ctx, entities[i], user_conn,
+        ctx, entities[i], conn_ent,
         rbufs[i].data, rbufs[i].len,
         decrypt_buf, sizeof(decrypt_buf), &decrypt_len);
 
@@ -363,17 +339,17 @@ void sh2_reads_tls_handshake(sh2_context_t *ctx) {
       continue;
 
     /* handshake complete — create server nghttp2 session */
-    sh2_conn_t *conn = sh2_conn_get(ctx, user_conn);
+    sh2_conn_t *conn = sh2_conn_get(ctx, conn_ent);
     if (!conn) { continue; }
 
-    if (sh2_nghttp2_session_create(ctx, user_conn) != sh2_ok) {
-      sh2_conn_close(ctx, user_conn);
+    if (sh2_nghttp2_session_create(ctx, conn_ent) != sh2_ok) {
+      sh2_conn_close(ctx, conn_ent);
       SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
                 "destroy read entity (session fail after handshake)");
       continue;
     }
 
-    conn = sh2_conn_get(ctx, user_conn);
+    conn = sh2_conn_get(ctx, conn_ent);
     if (!conn) { continue; }
 
     /* feed any decrypted data from the same segment to nghttp2 */
@@ -381,7 +357,7 @@ void sh2_reads_tls_handshake(sh2_context_t *ctx) {
       nghttp2_ssize consumed =
           nghttp2_session_mem_recv(conn->ng_session, decrypt_buf, decrypt_len);
       if (consumed < 0) {
-        sh2_conn_close(ctx, user_conn);
+        sh2_conn_close(ctx, conn_ent);
         SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
                   "destroy read entity (recv error after handshake)");
         continue;
@@ -406,7 +382,7 @@ void sh2_reads_feed_data(sh2_context_t *ctx) {
 
   shift_entity_t *entities = NULL;
   sio_read_buf_t *rbufs = NULL;
-  sio_user_conn_entity_t *uconns = NULL;
+  sio_conn_entity_t *conns = NULL;
   size_t count = 0;
 
   shift_collection_get_entities(sh, ctx->coll_read_active, &entities, &count);
@@ -417,13 +393,13 @@ void sh2_reads_feed_data(sh2_context_t *ctx) {
                                        ctx->sio_comp_ids.read_buf,
                                        (void **)&rbufs, NULL);
   shift_collection_get_component_array(sh, ctx->coll_read_active,
-                                       ctx->sio_comp_ids.user_conn_entity,
-                                       (void **)&uconns, NULL);
+                                       ctx->sio_comp_ids.conn_entity,
+                                       (void **)&conns, NULL);
 
   for (size_t i = 0; i < count; i++) {
-    shift_entity_t user_conn = uconns[i].entity;
+    shift_entity_t conn_ent = conns[i].entity;
 
-    sh2_conn_t *conn = sh2_conn_get(ctx, user_conn);
+    sh2_conn_t *conn = sh2_conn_get(ctx, conn_ent);
     if (!conn || !conn->ng_session) {
       SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
                 "destroy read entity (no session)");
@@ -441,7 +417,7 @@ void sh2_reads_feed_data(sh2_context_t *ctx) {
                                              decrypt_buf, sizeof(decrypt_buf),
                                              &decrypt_len);
       if (r == SH2_TLS_ERROR) {
-        sh2_conn_close(ctx, user_conn);
+        sh2_conn_close(ctx, conn_ent);
         SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
                   "destroy read entity (tls decrypt error)");
         continue;
@@ -451,7 +427,7 @@ void sh2_reads_feed_data(sh2_context_t *ctx) {
         nghttp2_ssize consumed =
             nghttp2_session_mem_recv(conn->ng_session, decrypt_buf, decrypt_len);
         if (consumed < 0) {
-          sh2_conn_close(ctx, user_conn);
+          sh2_conn_close(ctx, conn_ent);
           SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
                     "destroy read entity (recv error)");
           continue;
@@ -465,7 +441,7 @@ void sh2_reads_feed_data(sh2_context_t *ctx) {
           nghttp2_session_mem_recv(conn->ng_session, rbufs[i].data, rbufs[i].len);
 
       if (consumed < 0) {
-        sh2_conn_close(ctx, user_conn);
+        sh2_conn_close(ctx, conn_ent);
         SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
                   "destroy read entity (recv error)");
         continue;

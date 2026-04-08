@@ -8,13 +8,13 @@
  * which fields are populated — no other system needs to do state moves.
  * -------------------------------------------------------------------------- */
 
-/* Move NEW connections (in sio_connection_results) to their next state */
+/* Move NEW connections (in sio_connections) to their next state */
 void sh2_transition_new_connections(sh2_context_t *ctx) {
   shift_t *sh = ctx->shift;
   shift_entity_t *entities = NULL;
   size_t count = 0;
 
-  shift_collection_get_entities(sh, ctx->sio_connection_results,
+  shift_collection_get_entities(sh, ctx->sio_connections,
                                 &entities, &count);
   for (size_t i = 0; i < count; i++) {
     sh2_conn_t *conn = sh2_conn_get(ctx, entities[i]);

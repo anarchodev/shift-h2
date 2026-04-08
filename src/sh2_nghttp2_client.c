@@ -62,7 +62,7 @@ static int on_begin_headers_client(nghttp2_session *session,
 
     /* fallback: allocate for streams we didn't initiate (e.g. server push) */
     sh2_ng_ctx_t *nctx = user_data;
-    stream = sh2_stream_alloc(nctx->user_conn_entity);
+    stream = sh2_stream_alloc(nctx->conn_entity);
     if (!stream)
         return NGHTTP2_ERR_CALLBACK_FAILURE;
 
@@ -150,14 +150,14 @@ sh2_result_t sh2_nghttp2_client_init_callbacks(sh2_context_t *ctx) {
 }
 
 sh2_result_t sh2_nghttp2_client_session_create(sh2_context_t *ctx,
-                                                shift_entity_t user_conn_entity) {
-    sh2_conn_t *conn = sh2_conn_get(ctx, user_conn_entity);
+                                                shift_entity_t conn_entity) {
+    sh2_conn_t *conn = sh2_conn_get(ctx, conn_entity);
     if (!conn) return sh2_error_invalid;
 
     sh2_ng_ctx_t *nctx = malloc(sizeof(*nctx));
     if (!nctx) return sh2_error_oom;
     nctx->ctx              = ctx;
-    nctx->user_conn_entity = user_conn_entity;
+    nctx->conn_entity = conn_entity;
 
     int rv = nghttp2_session_client_new(&conn->ng_session,
                                         ctx->ng_client_callbacks, nctx);

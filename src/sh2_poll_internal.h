@@ -73,6 +73,7 @@ void sh2_transition_handshake_connections(sh2_context_t *ctx);
 
 void sh2_consume_connect_requests(sh2_context_t *ctx);
 void sh2_process_connect_results(sh2_context_t *ctx);
+void sh2_process_connect_errors(sh2_context_t *ctx);
 void sh2_reads_init_client_connections(sh2_context_t *ctx);
 void sh2_consume_client_requests(sh2_context_t *ctx);
 void sh2_consume_client_cancels(sh2_context_t *ctx);

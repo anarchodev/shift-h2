@@ -9,6 +9,8 @@
  * -------------------------------------------------------------------------- */
 
 void sh2_consume_responses(sh2_context_t *ctx) {
+  if (ctx->client_only) return;
+
   shift_t *sh = ctx->shift;
   shift_collection_id_t coll = ctx->coll_ids.response_in;
   shift_entity_t *entities = NULL;
@@ -194,10 +196,11 @@ sh2_result_t sh2_poll(sh2_context_t *ctx, uint32_t min_complete) {
    * After this, entity collection membership reflects user submissions. */
   SH2_CHECK(shift_flush(ctx->shift), "shift_flush");
 
-  /* PHASE 2: Process sio connect results (client outbound connections). */
+  /* PHASE 2: Initialize new client connections and process connect errors. */
   sh2_process_connect_results(ctx);
-  /* FLUSH: Materialize connect result processing (sio entities destroyed,
-   * connection state initialized on user_conn entities). */
+  sh2_process_connect_errors(ctx);
+  /* FLUSH: Materialize connect processing (client conn init, error entity
+   * moves to connect_errors, sio error entities destroyed). */
   SH2_CHECK(shift_flush(ctx->shift), "shift_flush");
 
   /* PHASE 3: Read triage — sort sio read results by connection state. */
@@ -219,7 +222,7 @@ sh2_result_t sh2_poll(sh2_context_t *ctx, uint32_t min_complete) {
 
   /* PHASE 6: Transition NEW user_conn entities to active or tls_handshake. */
   sh2_transition_new_connections(ctx);
-  /* FLUSH: Materialize user_conn moves (sio_connection_results → active
+  /* FLUSH: Materialize user_conn moves (sio_connections → active
    * or → tls_handshake). Required before handshake pass reads them. */
   SH2_CHECK(shift_flush(ctx->shift), "shift_flush");
 

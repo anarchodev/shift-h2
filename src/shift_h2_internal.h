@@ -46,6 +46,7 @@ typedef struct sh2_conn {
     uint32_t           pending_writes;   /* outstanding write entities */
     uint64_t           last_active_ns;   /* CLOCK_MONOTONIC nanos of last activity */
     char              *hostname;        /* client connections: target hostname (owned) */
+    shift_entity_t     pending_user_entity; /* user's connect_in entity in connect_pending */
 #ifdef SH2_HAS_TLS
     sh2_tls_conn_t    *tls;             /* NULL for h2c connections */
 #endif
@@ -65,6 +66,16 @@ typedef struct {
 } sh2_hostname_t;
 
 /* --------------------------------------------------------------------------
+ * Internal connect entity handle — carried on sio connect entities so the
+ * user's original connect_in entity can be correlated back after sio
+ * completes the TCP connect.
+ * -------------------------------------------------------------------------- */
+
+typedef struct {
+    shift_entity_t entity;  /* user's connect_in entity, parked in connect_pending */
+} sh2_connect_entity_t;
+
+/* --------------------------------------------------------------------------
  * Response body send tracking (nghttp2 data provider source)
  * -------------------------------------------------------------------------- */
 
@@ -79,7 +90,7 @@ typedef struct {
  * -------------------------------------------------------------------------- */
 
 typedef struct {
-    shift_entity_t      user_conn_entity;
+    shift_entity_t      conn_entity;
     sh2_header_field_t *hdr_fields;
     uint32_t            hdr_count;
     uint32_t            hdr_cap;
@@ -102,7 +113,7 @@ typedef struct {
 
 struct sh2_ng_ctx {
     sh2_context_t     *ctx;
-    shift_entity_t     user_conn_entity;
+    shift_entity_t     conn_entity;
 };
 
 /* --------------------------------------------------------------------------
@@ -112,21 +123,22 @@ struct sh2_ng_ctx {
 struct sh2_context {
     shift_t                    *shift;
     sh2_component_ids_t         comp_ids;
+    bool                        client_only;
     sh2_collection_ids_t        coll_ids;
     shift_collection_id_t       coll_response_sending;
 
     /* shift-io */
     sio_context_t              *sio;
     sio_component_ids_t         sio_comp_ids;
-    shift_collection_id_t       sio_connection_results;
+    shift_collection_id_t       sio_connections;     /* sio-managed connection entities */
     shift_collection_id_t       sio_read_results;
     shift_collection_id_t       sio_write_results;
 
-    /* internal connection component (sh2_conn_t) on user_conn entities */
+    /* internal connection component (sh2_conn_t) on connection entities */
     shift_component_id_t        internal_conn;
 
-    /* connection state collections (user_conn entities move between these) */
-    /* NEW state = sio_connection_results (sio creates user_conn entities there) */
+    /* connection state collections (connection entities move between these) */
+    /* NEW state = sio_connections (sio creates/moves connection entities there) */
     shift_collection_id_t       coll_conn_active;        /* nghttp2 session live */
     shift_collection_id_t       coll_conn_tls_handshake; /* TLS handshake in progress */
     shift_collection_id_t       coll_conn_draining;      /* session gone, writes pending */
@@ -155,14 +167,16 @@ struct sh2_context {
     /* client / outgoing connection support */
     bool                        enable_connect;
     sh2_client_collection_ids_t coll_ids_client;
-    shift_collection_id_t       sio_connect_results;
+    shift_collection_id_t       sio_connect_errors;          /* sio failed connect entities */
+    shift_collection_id_t       coll_connect_pending;        /* user entities parked during sio connect */
     shift_collection_id_t       coll_client_request_sending;
     shift_collection_id_t       coll_read_client_init;
     shift_collection_id_t       coll_read_client_handshake;
     nghttp2_session_callbacks  *ng_client_callbacks;
 
-    /* internal hostname component for connect entities */
+    /* internal components for connect entities */
     shift_component_id_t        internal_hostname;
+    shift_component_id_t        internal_connect_entity;
 
 #ifdef SH2_HAS_TLS
     /* TLS state (client) */
@@ -176,9 +190,9 @@ struct sh2_context {
  * -------------------------------------------------------------------------- */
 
 static inline sh2_conn_t *sh2_conn_get(sh2_context_t *ctx,
-                                        shift_entity_t user_conn_entity) {
+                                        shift_entity_t conn_entity) {
     sh2_conn_t *conn = NULL;
-    shift_entity_get_component(ctx->shift, user_conn_entity,
+    shift_entity_get_component(ctx->shift, conn_entity,
                                ctx->internal_conn, (void **)&conn);
     return conn;
 }

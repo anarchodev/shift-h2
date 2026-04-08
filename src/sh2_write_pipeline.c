@@ -11,7 +11,7 @@ void sh2_writes_account_and_close(sh2_context_t *ctx) {
   shift_entity_t *entities = NULL;
   sio_write_buf_t *wbufs = NULL;
   sio_io_result_t *results = NULL;
-  sio_user_conn_entity_t *uconns = NULL;
+  sio_conn_entity_t *conns = NULL;
   size_t count = 0;
 
   shift_collection_get_entities(sh, ctx->sio_write_results, &entities, &count);
@@ -25,23 +25,23 @@ void sh2_writes_account_and_close(sh2_context_t *ctx) {
                                        ctx->sio_comp_ids.io_result,
                                        (void **)&results, NULL);
   shift_collection_get_component_array(sh, ctx->sio_write_results,
-                                       ctx->sio_comp_ids.user_conn_entity,
-                                       (void **)&uconns, NULL);
+                                       ctx->sio_comp_ids.conn_entity,
+                                       (void **)&conns, NULL);
 
   for (size_t i = 0; i < count; i++) {
     /* free the copied send data */
     free((void *)wbufs[i].data);
     wbufs[i].data = NULL;
 
-    shift_entity_t user_conn = uconns[i].entity;
-    if (shift_entity_is_stale(sh, user_conn) ||
-        shift_entity_is_moving(sh, user_conn)) {
+    shift_entity_t conn_ent = conns[i].entity;
+    if (shift_entity_is_stale(sh, conn_ent) ||
+        shift_entity_is_moving(sh, conn_ent)) {
       SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
                 "destroy write entity (stale)");
       continue;
     }
 
-    sh2_conn_t *conn = sh2_conn_get(ctx, user_conn);
+    sh2_conn_t *conn = sh2_conn_get(ctx, conn_ent);
     if (!conn) {
       SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
                 "destroy write entity (no conn)");
@@ -56,9 +56,9 @@ void sh2_writes_account_and_close(sh2_context_t *ctx) {
     /* on write error, close active connection */
     if (results[i].error != 0) {
       shift_collection_id_t conn_coll = 0;
-      shift_entity_get_collection(sh, user_conn, &conn_coll);
+      shift_entity_get_collection(sh, conn_ent, &conn_coll);
       if (conn_coll == ctx->coll_conn_active)
-        sh2_conn_close(ctx, user_conn);
+        sh2_conn_close(ctx, conn_ent);
     }
 
     SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
@@ -82,13 +82,10 @@ void sh2_writes_finalize_draining(sh2_context_t *ctx) {
     if (!conn || conn->pending_writes > 0)
       continue;
 
-    if (!shift_entity_is_stale(sh, conn->conn_entity))
-      SH2_CHECK(shift_entity_destroy_one(sh, conn->conn_entity),
-                "destroy conn_entity (drain)");
-    /* Destroying user_conn_entity triggers conn_dtor which cleans up
-     * remaining resources (hostname, etc.) */
+    /* Destroying the connection entity triggers conn_dtor which cleans up
+     * remaining resources (hostname, nghttp2 session, etc.) */
     if (!shift_entity_is_stale(sh, entities[i]))
       SH2_CHECK(shift_entity_destroy_one(sh, entities[i]),
-                "destroy user_conn (drain)");
+                "destroy conn_entity (drain)");
   }
 }

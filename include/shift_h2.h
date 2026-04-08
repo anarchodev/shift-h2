@@ -122,7 +122,8 @@ typedef struct {
 
 typedef struct {
     /* request_out: full request received (END_STREAM).
-     *   Required components: {stream_id, session, req_headers, req_body}.
+     *   Components: {stream_id, session, req_headers, req_body,
+     *                domain_tag, peer_cert}.
      *   App moves entities through its own processing collections, then
      *   does a move into response_in once the response is ready. */
     shift_collection_id_t request_out;
@@ -148,12 +149,28 @@ typedef struct {
 /* Client (outgoing) collection IDs — only valid when enable_connect is true. */
 typedef struct {
     /* connect_in: app creates entities with sh2_connect_target_t here to
-     *   initiate an outgoing TCP connection. */
+     *   initiate an outgoing TCP connection.
+     *   Required components: {connect_target}.
+     *   The same entity will appear in connect_out (success) or
+     *   connect_errors (failure).  User-added components present on
+     *   the destination archetype are preserved. */
     shift_collection_id_t connect_in;
 
-    /* connect_out: connection established (io_result.error == 0) or
-     *   failed (io_result.error < 0).  On success, session.entity is set. */
+    /* connect_out: connection established — same entity as connect_in.
+     *   Written by sh2: session.
+     *   session.entity is the connection handle.
+     *   Required components: {connect_target, session}.
+     *   connect_target is passed through from connect_in.
+     *   App destroys entity when done. */
     shift_collection_id_t connect_out;
+
+    /* connect_errors: connection failed — same entity as connect_in.
+     *   Written by sh2: io_result.
+     *   io_result.error < 0: errno-style error code.
+     *   Required components: {connect_target, io_result}.
+     *   connect_target is passed through from connect_in.
+     *   App destroys entity when done. */
+    shift_collection_id_t connect_errors;
 
     /* disconnect_in: app creates an entity here to gracefully close a
      *   connection.  Required components: {session}.
@@ -263,9 +280,14 @@ typedef struct {
      * shift-io which uses io_uring_queue_init_params(), allowing flags like
      * IORING_SETUP_SQPOLL.  NULL = default (flags 0). */
     struct io_uring_params *ring_params;
+    /* Client-only mode — when true, the server-side collections below are
+     * not required and the library will not create server nghttp2 sessions
+     * or accept inbound connections.  enable_connect must also be true. */
+    bool                  client_only;
     /* User-provided result collections.  Each must carry at least the
      * required sh2 components listed above.  Extra components are allowed
-     * and preserved across entity moves. */
+     * and preserved across entity moves.
+     * Not required when client_only is true. */
     shift_collection_id_t request_out;
     shift_collection_id_t response_in;
     shift_collection_id_t response_out;
