@@ -192,7 +192,7 @@ void sh2_reads_init_connections(sh2_context_t *ctx) {
 
     /* Initialize connection state on the component */
     conn->conn_entity = conns[i].entity;
-    conn->last_active_poll = ctx->poll_count;
+    conn->last_active_ns = sh2_monotonic_ns();
 
 #ifdef SH2_HAS_TLS
     if (ctx->tls_config) {
@@ -319,7 +319,7 @@ sh2_hs_step_t sh2_tls_handshake_step(
   }
 
   /* handshake needs more data — recycle read buffer */
-  conn->last_active_poll = ctx->poll_count;
+  conn->last_active_ns = sh2_monotonic_ns();
   SH2_CHECK(shift_entity_move_one(sh, read_entity, sio_colls->read_in),
             "recycle read buffer (handshake continue)");
   return SH2_HS_CONTINUE;
@@ -388,7 +388,7 @@ void sh2_reads_tls_handshake(sh2_context_t *ctx) {
       }
     }
 
-    conn->last_active_poll = ctx->poll_count;
+    conn->last_active_ns = sh2_monotonic_ns();
 
     SH2_CHECK(shift_entity_move_one(sh, entities[i], sio_colls->read_in),
               "recycle read buffer (handshake done)");
@@ -472,7 +472,7 @@ void sh2_reads_feed_data(sh2_context_t *ctx) {
       }
     }
 
-    conn->last_active_poll = ctx->poll_count;
+    conn->last_active_ns = sh2_monotonic_ns();
 
     /* recycle read buffer */
     SH2_CHECK(shift_entity_move_one(sh, entities[i], sio_colls->read_in),

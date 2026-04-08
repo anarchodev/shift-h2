@@ -83,9 +83,11 @@ static int on_header_client(nghttp2_session *session,
         session, frame->hd.stream_id);
     if (!stream) return 0;
 
-    /* parse :status pseudo-header */
+    /* parse :status pseudo-header — don't append it to the header fields
+     * since it's conveyed via the status component */
     if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
         stream->response_status = (uint16_t)atoi((const char *)value);
+        return 0;
     }
 
     if (!sh2_stream_hdr_append(stream, name, namelen, value, valuelen))

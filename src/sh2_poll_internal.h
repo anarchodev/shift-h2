@@ -2,8 +2,16 @@
 
 #include "shift_h2_internal.h"
 
-/* Idle threshold: evict connections with no activity for this many polls. */
-#define SH2_IDLE_POLL_THRESHOLD 100000
+/* Idle threshold: evict connections with no activity for this duration. */
+#define SH2_IDLE_TIMEOUT_NS (10ULL * 1000000000ULL)  /* 10 seconds */
+
+#include <time.h>
+
+static inline uint64_t sh2_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 /* --------------------------------------------------------------------------
  * Server: consume response_in and drive sends

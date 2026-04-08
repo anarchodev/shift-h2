@@ -51,7 +51,7 @@ void sh2_writes_account_and_close(sh2_context_t *ctx) {
     if (conn->pending_writes > 0)
       conn->pending_writes--;
 
-    conn->last_active_poll = ctx->poll_count;
+    conn->last_active_ns = sh2_monotonic_ns();
 
     /* on write error, close active connection */
     if (results[i].error != 0) {

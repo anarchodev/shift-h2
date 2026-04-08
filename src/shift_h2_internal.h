@@ -44,7 +44,7 @@ typedef struct sh2_conn {
     sh2_ng_ctx_t      *ng_ctx;           /* nghttp2 session user_data */
     shift_entity_t     conn_entity;      /* sio internal connection entity */
     uint32_t           pending_writes;   /* outstanding write entities */
-    uint64_t           last_active_poll; /* poll tick of last activity */
+    uint64_t           last_active_ns;   /* CLOCK_MONOTONIC nanos of last activity */
     char              *hostname;        /* client connections: target hostname (owned) */
 #ifdef SH2_HAS_TLS
     sh2_tls_conn_t    *tls;             /* NULL for h2c connections */

@@ -119,7 +119,7 @@ void sh2_process_connect_results(sh2_context_t *ctx) {
     /* Initialize connection state */
     conn->direction       = SH2_DIR_CLIENT;
     conn->conn_entity     = conn_ent;
-    conn->last_active_poll = ctx->poll_count;
+    conn->last_active_ns = sh2_monotonic_ns();
 
     /* Transfer hostname ownership from connect entity to connection */
     conn->hostname = hostnames[i].hostname;
@@ -259,7 +259,7 @@ void sh2_reads_init_client_connections(sh2_context_t *ctx) {
     char *hostname = conn->hostname; /* preserved from process_connect_results */
 
     conn->conn_entity = conns[i].entity;
-    conn->last_active_poll = ctx->poll_count;
+    conn->last_active_ns = sh2_monotonic_ns();
 
 #ifdef SH2_HAS_TLS
     if (ctx->tls_client_config) {
@@ -424,7 +424,7 @@ void sh2_reads_client_tls_handshake(sh2_context_t *ctx) {
       }
     }
 
-    conn->last_active_poll = ctx->poll_count;
+    conn->last_active_ns = sh2_monotonic_ns();
 
     /* emit connect_out — session is ready */
     {

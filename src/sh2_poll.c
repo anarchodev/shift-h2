@@ -144,7 +144,8 @@ void sh2_drive_all_sends(sh2_context_t *ctx) {
       continue;
 
     /* evict idle connections — safety net for zombie sessions */
-    if (ctx->poll_count - conn->last_active_poll > SH2_IDLE_POLL_THRESHOLD) {
+    if (conn->last_active_ns > 0 &&
+        sh2_monotonic_ns() - conn->last_active_ns > SH2_IDLE_TIMEOUT_NS) {
       sh2_conn_close(ctx, uce);
       continue;
     }
@@ -158,7 +159,7 @@ void sh2_drive_all_sends(sh2_context_t *ctx) {
       /* Re-fetch conn since drive_send may have destroyed it */
       conn = sh2_conn_get(ctx, uce);
       if (conn)
-        conn->last_active_poll = ctx->poll_count;
+        conn->last_active_ns = sh2_monotonic_ns();
     }
   }
 }
