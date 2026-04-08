@@ -6,6 +6,7 @@
  * Shared stream helpers (used by both server and client nghttp2 paths)
  * -------------------------------------------------------------------------- */
 
+sh2_body_data_t    *sh2_body_data_alloc(const void *data, uint32_t len);
 sh2_stream_t       *sh2_stream_alloc(shift_entity_t conn_entity);
 void                sh2_stream_free(sh2_stream_t *s);
 bool                sh2_stream_hdr_append(sh2_stream_t *s,

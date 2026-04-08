@@ -22,7 +22,7 @@ static void stream_emit_response(sh2_context_t *ctx, sh2_stream_t *stream) {
                                           (void **)&rh),
               "get resp_headers (client response)");
     rh->fields = fields;
-    rh->count  = hdr_count;
+    rh->count  = fields ? hdr_count : 0;
 
     /* resp_body — transfer ownership */
     sh2_resp_body_t *rb = NULL;
@@ -86,7 +86,11 @@ static int on_header_client(nghttp2_session *session,
     /* parse :status pseudo-header — don't append it to the header fields
      * since it's conveyed via the status component */
     if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
-        stream->response_status = (uint16_t)atoi((const char *)value);
+        char buf[4];
+        size_t n = valuelen < sizeof(buf) - 1 ? valuelen : sizeof(buf) - 1;
+        memcpy(buf, value, n);
+        buf[n] = '\0';
+        stream->response_status = (uint16_t)atoi(buf);
         return 0;
     }
 
@@ -171,9 +175,15 @@ sh2_result_t sh2_nghttp2_client_session_create(sh2_context_t *ctx,
     nghttp2_settings_entry settings[] = {
         { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 128 },
     };
-    nghttp2_submit_settings(conn->ng_session, NGHTTP2_FLAG_NONE,
-                            settings,
-                            sizeof(settings) / sizeof(settings[0]));
+    if (nghttp2_submit_settings(conn->ng_session, NGHTTP2_FLAG_NONE,
+                                settings,
+                                sizeof(settings) / sizeof(settings[0])) != 0) {
+        nghttp2_session_del(conn->ng_session);
+        conn->ng_session = NULL;
+        free(nctx);
+        conn->ng_ctx = NULL;
+        return sh2_error_invalid;
+    }
 
     return sh2_ok;
 }

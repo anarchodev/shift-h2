@@ -76,14 +76,15 @@ typedef struct {
 } sh2_connect_entity_t;
 
 /* --------------------------------------------------------------------------
- * Response body send tracking (nghttp2 data provider source)
+ * Body send tracking (nghttp2 data provider source)
+ * Used for both server response bodies and client request bodies.
  * -------------------------------------------------------------------------- */
 
 typedef struct {
     const void *data;
     uint32_t    len;
     uint32_t    offset;
-} sh2_resp_data_t;
+} sh2_body_data_t;
 
 /* --------------------------------------------------------------------------
  * Per-stream accumulation (nghttp2 stream user_data)
@@ -104,7 +105,7 @@ typedef struct {
     bool                emitted;
     bool                send_complete;
     uint16_t            response_status; /* parsed :status for client mode */
-    sh2_resp_data_t    *resp_data;       /* owned; freed on EOF or early close */
+    sh2_body_data_t    *send_data;       /* owned; freed on EOF or early close */
 } sh2_stream_t;
 
 /* --------------------------------------------------------------------------

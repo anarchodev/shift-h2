@@ -64,7 +64,12 @@ void sh2_consume_responses(sh2_context_t *ctx) {
 
     uint32_t nv_count = 1 + rh->count;
     nghttp2_nv *nva = malloc(nv_count * sizeof(nghttp2_nv));
-    if (!nva) continue;
+    if (!nva) {
+      ios[i].error = -1;
+      SH2_CHECK(shift_entity_move_one(sh, entity, ctx->coll_ids.response_out),
+                "move OOM entity to result_out");
+      continue;
+    }
 
     nva[0] = (nghttp2_nv){
         .name     = (uint8_t *)":status",
@@ -89,21 +94,29 @@ void sh2_consume_responses(sh2_context_t *ctx) {
      * is independent of user-owned memory lifetime */
     nghttp2_data_provider data_prd = {0};
     if (rb->data && rb->len > 0) {
-      sh2_resp_data_t *rd = malloc(sizeof(*rd) + rb->len);
-      if (rd) {
-        void *copy = (uint8_t *)rd + sizeof(*rd);
-        memcpy(copy, rb->data, rb->len);
-        rd->data   = copy;
-        rd->len    = rb->len;
-        rd->offset = 0;
-        data_prd.source.ptr    = rd;
-        data_prd.read_callback = on_data_source_read;
+      sh2_body_data_t *rd = sh2_body_data_alloc(rb->data, rb->len);
+      if (!rd) {
+        free(nva);
+        ios[i].error = -1;
+        SH2_CHECK(shift_entity_move_one(sh, entity, ctx->coll_ids.response_out),
+                  "move body-OOM entity to result_out");
+        continue;
       }
+      data_prd.source.ptr    = rd;
+      data_prd.read_callback = on_data_source_read;
     }
 
-    nghttp2_submit_response(conn->ng_session, (int32_t)sid->id, nva, nv_count,
-                            data_prd.read_callback ? &data_prd : NULL);
+    int rv = nghttp2_submit_response(conn->ng_session, (int32_t)sid->id, nva,
+                                      nv_count,
+                                      data_prd.read_callback ? &data_prd : NULL);
     free(nva);
+    if (rv < 0) {
+      ios[i].error = -1;
+      if (data_prd.source.ptr) free(data_prd.source.ptr);
+      SH2_CHECK(shift_entity_move_one(sh, entity, ctx->coll_ids.response_out),
+                "move submit_response error to result_out");
+      continue;
+    }
 
     /* find the stream and associate the entity with it — must happen
      * before the deferred move so we never access components afterward */
@@ -113,7 +126,7 @@ void sh2_consume_responses(sh2_context_t *ctx) {
       stream->entity        = entity;
       stream->emitted       = true;
       stream->send_complete = !data_prd.read_callback;
-      stream->resp_data     = data_prd.source.ptr;
+      stream->send_data     = data_prd.source.ptr;
       SH2_CHECK(shift_entity_move_one(sh, entity, ctx->coll_response_sending),
                 "move entity to sending");
     } else {

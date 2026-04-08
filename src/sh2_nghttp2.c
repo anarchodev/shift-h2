@@ -18,7 +18,7 @@ void sh2_stream_free(sh2_stream_t *s) {
     free(s->hdr_fields);
     free(s->hdr_strbuf);
     free(s->body_data);
-    free(s->resp_data);
+    free(s->send_data);
     free(s);
 }
 
@@ -95,6 +95,17 @@ sh2_header_field_t *sh2_stream_hdr_finalize(sh2_stream_t *s,
     return result;
 }
 
+sh2_body_data_t *sh2_body_data_alloc(const void *data, uint32_t len) {
+    sh2_body_data_t *rd = malloc(sizeof(*rd) + len);
+    if (!rd) return NULL;
+    void *copy = (uint8_t *)rd + sizeof(*rd);
+    memcpy(copy, data, len);
+    rd->data   = copy;
+    rd->len    = len;
+    rd->offset = 0;
+    return rd;
+}
+
 bool sh2_stream_body_append(sh2_stream_t *s,
                                const uint8_t *data, size_t len) {
     while (s->body_len + len > s->body_cap) {
@@ -146,7 +157,7 @@ static void stream_emit_request(sh2_context_t *ctx, sh2_stream_t *stream,
                                           (void **)&rh),
               "get req_headers component");
     rh->fields = fields;
-    rh->count  = hdr_count;
+    rh->count  = fields ? hdr_count : 0;
 
     /* req_body — transfer ownership */
     sh2_req_body_t *rb = NULL;
@@ -309,7 +320,7 @@ nghttp2_ssize on_data_source_read(
     nghttp2_data_source *source, void *user_data) {
     (void)user_data;
 
-    sh2_resp_data_t *rd = source->ptr;
+    sh2_body_data_t *rd = source->ptr;
     size_t remaining = rd->len - rd->offset;
     size_t to_copy = remaining < length ? remaining : length;
 
@@ -325,7 +336,7 @@ nghttp2_ssize on_data_source_read(
             session, stream_id);
         if (stream) {
             stream->send_complete = true;
-            stream->resp_data    = NULL;
+            stream->send_data    = NULL;
         }
 
         free(rd);
@@ -375,9 +386,15 @@ sh2_result_t sh2_nghttp2_session_create(sh2_context_t *ctx,
     nghttp2_settings_entry settings[] = {
         { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 128 },
     };
-    nghttp2_submit_settings(conn->ng_session, NGHTTP2_FLAG_NONE,
-                            settings,
-                            sizeof(settings) / sizeof(settings[0]));
+    if (nghttp2_submit_settings(conn->ng_session, NGHTTP2_FLAG_NONE,
+                                settings,
+                                sizeof(settings) / sizeof(settings[0])) != 0) {
+        nghttp2_session_del(conn->ng_session);
+        conn->ng_session = NULL;
+        free(nctx);
+        conn->ng_ctx = NULL;
+        return sh2_error_invalid;
+    }
 
     return sh2_ok;
 }
@@ -535,9 +552,6 @@ sh2_result_t sh2_drive_send(sh2_context_t *ctx,
             if (!shift_entity_is_stale(sh, conn_entity))
                 SH2_CHECK(shift_entity_destroy_one(sh, conn_entity),
                           "destroy conn_entity (drive_send)");
-            if (!shift_entity_is_stale(sh, conn_entity))
-                SH2_CHECK(shift_entity_destroy_one(sh, conn_entity),
-                          "destroy conn_entity (drive_send)");
         }
     }
 
@@ -566,9 +580,6 @@ void sh2_conn_close(sh2_context_t *ctx, shift_entity_t conn_entity) {
 
     /* destroy sio entities — triggers fd close via conn_dtor */
     if (conn && !shift_entity_is_stale(sh, conn_entity))
-        SH2_CHECK(shift_entity_destroy_one(sh, conn_entity),
-                  "destroy conn_entity (conn_close)");
-    if (!shift_entity_is_stale(sh, conn_entity))
         SH2_CHECK(shift_entity_destroy_one(sh, conn_entity),
                   "destroy conn_entity (conn_close)");
 }

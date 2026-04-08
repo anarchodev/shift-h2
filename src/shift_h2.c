@@ -416,6 +416,7 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
                                       &ctx->coll_conn_tls_handshake) != shift_ok ||
             shift_collection_register(ctx->shift, &ci_drain,
                                       &ctx->coll_conn_draining) != shift_ok) {
+            sio_context_destroy(ctx->sio);
             free(ctx);
             return sh2_error_invalid;
         }
@@ -545,6 +546,8 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         if (r != sh2_ok) {
             sio_context_destroy(ctx->sio);
             nghttp2_session_callbacks_del(ctx->ng_callbacks);
+            if (ctx->ng_client_callbacks)
+                nghttp2_session_callbacks_del(ctx->ng_client_callbacks);
             free(ctx);
             return r;
         }

@@ -506,7 +506,13 @@ void sh2_consume_client_requests(sh2_context_t *ctx) {
     /* build nghttp2_nv array from req_headers */
     uint32_t nv_count = rh->count;
     nghttp2_nv *nva = malloc(nv_count * sizeof(nghttp2_nv));
-    if (!nva) continue;
+    if (!nva) {
+      ios[i].error = -1;
+      SH2_CHECK(shift_entity_move_one(sh, entity,
+                    ctx->coll_ids_client.response_out),
+                "move OOM client request to result_out");
+      continue;
+    }
 
     for (uint32_t j = 0; j < rh->count; j++) {
       nva[j] = (nghttp2_nv){
@@ -522,16 +528,17 @@ void sh2_consume_client_requests(sh2_context_t *ctx) {
     /* data provider for request body */
     nghttp2_data_provider data_prd = {0};
     if (rb->data && rb->len > 0) {
-      sh2_resp_data_t *rd = malloc(sizeof(*rd) + rb->len);
-      if (rd) {
-        void *copy = (uint8_t *)rd + sizeof(*rd);
-        memcpy(copy, rb->data, rb->len);
-        rd->data   = copy;
-        rd->len    = rb->len;
-        rd->offset = 0;
-        data_prd.source.ptr    = rd;
-        data_prd.read_callback = on_data_source_read;
+      sh2_body_data_t *rd = sh2_body_data_alloc(rb->data, rb->len);
+      if (!rd) {
+        free(nva);
+        ios[i].error = -1;
+        SH2_CHECK(shift_entity_move_one(sh, entity,
+                      ctx->coll_ids_client.response_out),
+                  "move body-OOM client request to result_out");
+        continue;
       }
+      data_prd.source.ptr    = rd;
+      data_prd.read_callback = on_data_source_read;
     }
 
     int32_t stream_id = nghttp2_submit_request(
@@ -556,6 +563,7 @@ void sh2_consume_client_requests(sh2_context_t *ctx) {
     sh2_stream_t *stream = sh2_stream_alloc(sess->entity);
     if (!stream) {
       ios[i].error = -1;
+      if (data_prd.source.ptr) free(data_prd.source.ptr);
       nghttp2_submit_rst_stream(conn->ng_session, NGHTTP2_FLAG_NONE,
                                 stream_id, NGHTTP2_INTERNAL_ERROR);
       SH2_CHECK(shift_entity_move_one(sh, entity,
@@ -565,7 +573,7 @@ void sh2_consume_client_requests(sh2_context_t *ctx) {
     }
     stream->entity        = entity;
     stream->send_complete = !data_prd.read_callback;
-    stream->resp_data     = data_prd.source.ptr;
+    stream->send_data     = data_prd.source.ptr;
     nghttp2_session_set_stream_user_data(conn->ng_session, stream_id, stream);
 
     SH2_CHECK(shift_entity_move_one(sh, entity, ctx->coll_client_request_sending),
@@ -608,7 +616,8 @@ void sh2_consume_client_connect_closes(sh2_context_t *ctx) {
                             last_stream_id, NGHTTP2_NO_ERROR, NULL, 0);
     }
 
-    shift_entity_destroy_one(sh, entity);
+    SH2_CHECK(shift_entity_destroy_one(sh, entity),
+              "destroy disconnect_in entity");
   }
 }
 
