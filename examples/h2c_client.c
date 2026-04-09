@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
         comp.domain_tag, comp.peer_cert,
     };
     shift_component_id_t connect_in_comps[] = {
-        comp.connect_target, comp.session, comp.io_result,
+        comp.connect_target,
     };
     shift_component_id_t connect_out_comps[] = {
         comp.connect_target, comp.session,

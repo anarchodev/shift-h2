@@ -151,9 +151,27 @@ void sh2_drive_all_sends(sh2_context_t *ctx) {
 
   shift_collection_get_entities(ctx->shift, ctx->coll_conn_active,
                                 &entities, &count);
+  if (count == 0) return;
+
+  /* Copy entity IDs — sh2_conn_close and sh2_drive_send call shift_flush
+   * internally, which can compact coll_conn_active and invalidate the
+   * SoA entities pointer.  Entity IDs survive across flushes. */
+  shift_entity_t local[256];
+  shift_entity_t *ids = local;
+  if (count > sizeof(local) / sizeof(local[0])) {
+    ids = malloc(count * sizeof(shift_entity_t));
+    if (!ids) return;
+  }
+  memcpy(ids, entities, count * sizeof(shift_entity_t));
 
   for (size_t i = 0; i < count; i++) {
-    shift_entity_t uce = entities[i];
+    shift_entity_t uce = ids[i];
+
+    /* Entity may have been destroyed by a prior iteration's conn_close
+     * or drive_send — skip stale handles. */
+    if (shift_entity_is_stale(ctx->shift, uce))
+      continue;
+
     sh2_conn_t *conn = sh2_conn_get(ctx, uce);
     if (!conn || !conn->ng_session)
       continue;
@@ -177,6 +195,8 @@ void sh2_drive_all_sends(sh2_context_t *ctx) {
         conn->last_active_ns = sh2_monotonic_ns();
     }
   }
+
+  if (ids != local) free(ids);
 }
 
 /* --------------------------------------------------------------------------

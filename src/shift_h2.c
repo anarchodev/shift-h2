@@ -71,6 +71,16 @@ static void peer_cert_dtor(shift_t *ctx, shift_collection_id_t col_id,
     }
 }
 
+/* Connection component constructor — initialize sentinel fields. */
+static void conn_ctor(shift_t *ctx, shift_collection_id_t col_id,
+                      const shift_entity_t *entities, void *data,
+                      uint32_t offset, uint32_t count, void *user_data) {
+    (void)ctx; (void)col_id; (void)entities; (void)user_data;
+    sh2_conn_t *conns = (sh2_conn_t *)data + offset;
+    for (uint32_t i = 0; i < count; i++)
+        conns[i].pending_user_entity = SH2_ENTITY_NONE;
+}
+
 /* Connection component destructor — safety net for cleanup.
  * In the normal path, ng_session is already NULL (session_destroy was called
  * during draining).  This catches orphaned entities. */
@@ -98,16 +108,15 @@ static void conn_dtor(shift_t *ctx, shift_collection_id_t col_id,
     }
 }
 
-/* Hostname component destructor */
-static void hostname_dtor(shift_t *ctx, shift_collection_id_t col_id,
-                          const shift_entity_t *entities, void *data,
-                          uint32_t offset, uint32_t count, void *user_data) {
+/* Connect entity handle constructor — initialize to sentinel. */
+static void connect_entity_ctor(shift_t *ctx, shift_collection_id_t col_id,
+                                const shift_entity_t *entities, void *data,
+                                uint32_t offset, uint32_t count,
+                                void *user_data) {
     (void)ctx; (void)col_id; (void)entities; (void)user_data;
-    sh2_hostname_t *hs = (sh2_hostname_t *)data + offset;
-    for (uint32_t i = 0; i < count; i++) {
-        free(hs[i].hostname);
-        hs[i].hostname = NULL;
-    }
+    sh2_connect_entity_t *ces = (sh2_connect_entity_t *)data + offset;
+    for (uint32_t i = 0; i < count; i++)
+        ces[i].entity = SH2_ENTITY_NONE;
 }
 
 /* --------------------------------------------------------------------------
@@ -191,10 +200,11 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         return sh2_error_invalid;
     }
 
-    /* register internal connection component (sh2_conn_t) with destructor */
+    /* register internal connection component (sh2_conn_t) with ctor/dtor */
     {
         shift_component_info_t ci = {
             .element_size = sizeof(sh2_conn_t),
+            .constructor  = conn_ctor,
             .destructor   = conn_dtor,
         };
         if (shift_component_register(ctx->shift, &ci,
@@ -204,24 +214,14 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
         }
     }
 
-    /* register internal hostname component for connect entities */
-    {
-        shift_component_info_t ci = {
-            .element_size = sizeof(sh2_hostname_t),
-            .destructor   = hostname_dtor,
-        };
-        if (shift_component_register(ctx->shift, &ci,
-                                      &ctx->internal_hostname) != shift_ok) {
-            free(ctx);
-            return sh2_error_invalid;
-        }
-    }
-
     /* register internal connect entity handle component — carries a reference
-     * to the user's original connect_in entity through sio's pipeline */
+     * to the user's original connect_in entity through sio's pipeline.
+     * Constructor initializes to SH2_ENTITY_NONE so server-accepted
+     * connections never appear to have a parked user entity. */
     {
         shift_component_info_t ci = {
             .element_size = sizeof(sh2_connect_entity_t),
+            .constructor  = connect_entity_ctor,
         };
         if (shift_component_register(ctx->shift, &ci,
                                       &ctx->internal_connect_entity) != shift_ok) {
@@ -232,15 +232,16 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
 
     /* create sio collections — connections carries internal_conn so
      * sh2_conn_t lives on the connection entity itself.
-     * internal_hostname and internal_connect_entity are included so
-     * they survive sio's connect pipeline (superset of connections). */
+     * internal_connect_entity is included so it survives sio's connect
+     * pipeline (superset of connections).  connect_target is included so
+     * the hostname round-trips through sio without a separate copy. */
     {
         shift_component_id_t comps[] = {
             ctx->sio_comp_ids.fd,
             ctx->sio_comp_ids.read_cycle_entity,
             ctx->internal_conn,
-            ctx->internal_hostname,
             ctx->internal_connect_entity,
+            cfg->comp_ids.connect_target,
         };
         shift_collection_info_t ci = {
             .name       = "sio_connections",
@@ -298,8 +299,8 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             shift_component_id_t comps[] = {
                 ctx->sio_comp_ids.io_result,
                 ctx->sio_comp_ids.connect_addr,
-                ctx->internal_hostname,
                 ctx->internal_connect_entity,
+                cfg->comp_ids.connect_target,
             };
             shift_collection_info_t ci = {
                 .name       = "sio_connect_errors",
@@ -483,19 +484,43 @@ sh2_result_t sh2_context_create(const sh2_config_t *cfg, sh2_context_t **out) {
             return r;
         }
 
-        /* client internal collections */
+        /* client internal collection: client_request_sending
+         * Entities flow request_in → client_request_sending → response_out.
+         * Build as the union of both user collections so user-added
+         * components survive the round-trip (principle 9). */
         {
-            shift_component_id_t comps[] = {
-                cfg->comp_ids.stream_id,  cfg->comp_ids.session,
-                cfg->comp_ids.req_headers, cfg->comp_ids.req_body,
-                cfg->comp_ids.resp_headers, cfg->comp_ids.resp_body,
-                cfg->comp_ids.status,     cfg->comp_ids.io_result,
-                cfg->comp_ids.domain_tag, cfg->comp_ids.peer_cert,
-            };
+            const shift_component_id_t *rin_comps = NULL, *rout_comps = NULL;
+            uint32_t rin_count = 0, rout_count = 0;
+            if (shift_collection_get_components(ctx->shift,
+                    cfg->client_colls.request_in,
+                    &rin_comps, &rin_count) != shift_ok ||
+                shift_collection_get_components(ctx->shift,
+                    cfg->client_colls.response_out,
+                    &rout_comps, &rout_count) != shift_ok) {
+                sio_context_destroy(ctx->sio);
+                nghttp2_session_callbacks_del(ctx->ng_callbacks);
+                nghttp2_session_callbacks_del(ctx->ng_client_callbacks);
+                free(ctx);
+                return sh2_error_invalid;
+            }
+            /* merge + deduplicate */
+            shift_component_id_t merged[64];
+            uint32_t merged_count = 0;
+            const shift_component_id_t *lists[] = { rin_comps, rout_comps };
+            uint32_t counts[] = { rin_count, rout_count };
+            for (int l = 0; l < 2; l++) {
+                for (uint32_t j = 0; j < counts[l] && merged_count < 64; j++) {
+                    bool dup = false;
+                    for (uint32_t k = 0; k < merged_count; k++) {
+                        if (lists[l][j] == merged[k]) { dup = true; break; }
+                    }
+                    if (!dup) merged[merged_count++] = lists[l][j];
+                }
+            }
             shift_collection_info_t ci = {
                 .name       = "client_request_sending",
-                .comp_ids   = comps,
-                .comp_count = sizeof(comps) / sizeof(comps[0]),
+                .comp_ids   = merged,
+                .comp_count = merged_count,
             };
             if (shift_collection_register(ctx->shift, &ci,
                                           &ctx->coll_client_request_sending) != shift_ok) {

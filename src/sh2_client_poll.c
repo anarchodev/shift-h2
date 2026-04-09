@@ -32,7 +32,9 @@ void sh2_consume_connect_requests(sh2_context_t *ctx) {
   for (size_t i = 0; i < count; i++) {
     sh2_connect_target_t *tgt = &targets[i];
 
-    /* create sio connect entity — hostname travels with it through sio */
+    /* create sio connect entity — connect_target component round-trips
+     * through sio's pipeline (sio_connections is a superset), carrying
+     * the hostname without a separate copy. */
     shift_entity_t ce;
     SH2_CHECK(shift_entity_create_one_begin(sh, sio_colls->connect_in, &ce),
               "create sio connect entity");
@@ -43,18 +45,12 @@ void sh2_consume_connect_requests(sh2_context_t *ctx) {
               "get connect_addr");
     ca->addr = tgt->addr;
 
-    /* store hostname on the connect entity so it round-trips through sio */
-    sh2_hostname_t *hn = NULL;
-    SH2_CHECK(shift_entity_get_component(sh, ce, ctx->internal_hostname,
-                                          (void **)&hn),
-              "get hostname (connect)");
-    if (tgt->hostname && tgt->hostname_len > 0) {
-      hn->hostname = malloc(tgt->hostname_len + 1);
-      if (hn->hostname) {
-        memcpy(hn->hostname, tgt->hostname, tgt->hostname_len);
-        hn->hostname[tgt->hostname_len] = '\0';
-      }
-    }
+    /* propagate connect_target to sio entity so hostname survives */
+    sh2_connect_target_t *ct = NULL;
+    SH2_CHECK(shift_entity_get_component(sh, ce, ctx->comp_ids.connect_target,
+                                          (void **)&ct),
+              "get connect_target (sio connect)");
+    *ct = *tgt;
 
     /* store user entity handle on sio connect entity so we can
      * correlate it back when sio returns the connect result */
@@ -101,7 +97,7 @@ void sh2_process_connect_results(sh2_context_t *ctx) {
 
   sh2_conn_t *conns_arr = NULL;
   sh2_connect_entity_t *user_entities = NULL;
-  sh2_hostname_t *hostnames = NULL;
+  sh2_connect_target_t *targets = NULL;
 
   shift_collection_get_component_array(sh, ctx->sio_connections,
                                        ctx->internal_conn,
@@ -110,8 +106,8 @@ void sh2_process_connect_results(sh2_context_t *ctx) {
                                        ctx->internal_connect_entity,
                                        (void **)&user_entities, NULL);
   shift_collection_get_component_array(sh, ctx->sio_connections,
-                                       ctx->internal_hostname,
-                                       (void **)&hostnames, NULL);
+                                       ctx->comp_ids.connect_target,
+                                       (void **)&targets, NULL);
 
   for (size_t i = 0; i < count; i++) {
     /* skip server connections and already-initialized clients */
@@ -124,9 +120,15 @@ void sh2_process_connect_results(sh2_context_t *ctx) {
     conn->last_active_ns      = sh2_monotonic_ns();
     conn->pending_user_entity = user_ent;
 
-    /* Transfer hostname from component to conn struct */
-    conn->hostname = hostnames[i].hostname;
-    hostnames[i].hostname = NULL;
+    /* strdup hostname from connect_target into conn — connect_target is
+     * borrowed from user memory, conn->hostname is an owned copy. */
+    if (targets[i].hostname && targets[i].hostname_len > 0) {
+      conn->hostname = malloc(targets[i].hostname_len + 1);
+      if (conn->hostname) {
+        memcpy(conn->hostname, targets[i].hostname, targets[i].hostname_len);
+        conn->hostname[targets[i].hostname_len] = '\0';
+      }
+    }
 
 #ifdef SH2_HAS_TLS
     if (ctx->tls_client_config) {

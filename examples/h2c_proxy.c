@@ -409,7 +409,7 @@ int main(int argc, char **argv) {
     const size_t proxy_comps_count = sizeof(proxy_comps) / sizeof(proxy_comps[0]);
 
     shift_component_id_t connect_in_comps[] = {
-        p.comp.connect_target, p.comp.session, p.comp.io_result,
+        p.comp.connect_target,
     };
     shift_component_id_t connect_out_comps[] = {
         p.comp.connect_target, p.comp.session,

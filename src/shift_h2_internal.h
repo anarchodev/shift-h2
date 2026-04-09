@@ -14,6 +14,13 @@
 #define SH2_DIR_SERVER          0
 #define SH2_DIR_CLIENT          1
 
+/* Sentinel for "no entity" — zero is a valid entity ID in shift. */
+#define SH2_ENTITY_NONE ((shift_entity_t){ .index = UINT32_MAX, .generation = UINT32_MAX })
+
+static inline bool sh2_entity_is_none(shift_entity_t e) {
+    return e.index == UINT32_MAX && e.generation == UINT32_MAX;
+}
+
 /* Error code used when a stream closes before the response body is fully
  * sent — distinguishes "send interrupted" from a clean close. */
 #define SH2_ERR_SEND_INCOMPLETE 1
@@ -46,7 +53,8 @@ typedef struct sh2_conn {
     uint32_t           pending_writes;   /* outstanding write entities */
     uint64_t           last_active_ns;   /* CLOCK_MONOTONIC nanos of last activity */
     char              *hostname;        /* client connections: target hostname (owned) */
-    shift_entity_t     pending_user_entity; /* user's connect_in entity in connect_pending */
+    shift_entity_t     pending_user_entity; /* user's connect_in entity in connect_pending;
+                                            * SH2_ENTITY_NONE for server connections */
 #ifdef SH2_HAS_TLS
     sh2_tls_conn_t    *tls;             /* NULL for h2c connections */
 #endif
@@ -57,22 +65,14 @@ typedef struct sh2_conn {
 #endif
 
 /* --------------------------------------------------------------------------
- * Internal hostname component — carried on sio connect entities so the
- * hostname round-trips through sio's connect pipeline.
- * -------------------------------------------------------------------------- */
-
-typedef struct {
-    char *hostname;  /* owned, malloc'd copy */
-} sh2_hostname_t;
-
-/* --------------------------------------------------------------------------
  * Internal connect entity handle — carried on sio connect entities so the
  * user's original connect_in entity can be correlated back after sio
  * completes the TCP connect.
  * -------------------------------------------------------------------------- */
 
 typedef struct {
-    shift_entity_t entity;  /* user's connect_in entity, parked in connect_pending */
+    shift_entity_t entity;  /* user's connect_in entity, parked in connect_pending;
+                             * SH2_ENTITY_NONE for server-accepted connections */
 } sh2_connect_entity_t;
 
 /* --------------------------------------------------------------------------
@@ -175,8 +175,7 @@ struct sh2_context {
     shift_collection_id_t       coll_read_client_handshake;
     nghttp2_session_callbacks  *ng_client_callbacks;
 
-    /* internal components for connect entities */
-    shift_component_id_t        internal_hostname;
+    /* internal component for connect entities */
     shift_component_id_t        internal_connect_entity;
 
 #ifdef SH2_HAS_TLS
